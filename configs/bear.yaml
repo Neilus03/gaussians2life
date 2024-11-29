@@ -1,0 +1,110 @@
+name: "bear"
+tag: "${rmspace:${system.prompt_processor.prompt},_}"
+exp_root_dir: "outputs"
+seed: 0
+
+trainer:
+  max_steps: 8
+  log_every_n_steps: 1
+  num_sanity_val_steps: 0
+  val_check_interval: 1
+  enable_progress_bar: true
+  precision: 32
+
+data_type: "4dgs-multi-view-sample-once-datamodule"
+data:
+  height: 320
+  width: 512
+  num_frames: 8
+  eval_frames: 8
+  eval_height: 640
+  eval_width: 1024
+  test_height: 1080
+  test_width: 1920
+
+  azimuth_range: [ -120., 120. ]
+  elevation_range: [ -10., 10. ]
+  distance_range: [ -0.1, 0.1 ]
+  std_azimuth: 0.05
+  std_elevation: 0.05
+  std_distance: 0.01
+  fovx_range: [ 60, 60 ]
+  fovy_range: [ 40, 40 ]
+  eval_fovx_deg: 65
+  eval_fovy_deg: 40
+  eval_radius: 0.05
+
+  camera_up: [ 0., 0., 1. ]
+  camera_lookat: [ 0., 0., 0. ]
+  anchor_view: [ -1.3, -1.1, 0.4 ]
+
+  num_views_per_direction: 10
+  num_optimization_steps_before_resampling: 0
+  random_views: False
+
+system_type: "gauss-trajectory-4d-system"
+system:
+  debug: true
+  geometry_type: "gaussian-splatting-trajectories"
+  back_ground_color: [ 1.0, 1.0, 1.0 ]
+  last_step_rigid: False
+  geometry:
+    sh_degree: 0
+    geometry_convert_from: "custom/threestudio-gaussians2life/assets/sample_data/bear.ply"
+    num_frames: ${data.num_frames}
+    update_scale: False
+    update_rotation: True
+    num_nearest_neighbors: 50
+    anchor_view_multiplier: 2
+    num_nearest_neighbors_inference: 250
+    knn_weighting: 0.0
+
+    mask_path: "custom/threestudio-gaussians2life/assets/sample_data/mask_bear.pt"
+    box_rot_x: -5
+    box_rot_y: 130
+    box_rot_z: 90
+
+    inference_mode: "displacement"
+
+  material_type: "no-material" # unused
+  material:
+    n_output_dims: 0
+
+  background_type: "solid-color-background" # unused
+
+  renderer_type: "diff-gaussian-rasterizer-dynamic"
+  renderer:
+    debug: false
+    invert_bg_prob: 1.0
+
+  prompt_processor_type: ""
+  prompt_processor:
+    prompt: ???
+
+  guidance_type: "dynamicrafter-guidance"
+  guidance:
+    model_config: "custom/threestudio-gaussians2life/guidance/dynamicrafter/configs/inference_512_v1.0.yaml"
+    ckpt_path: "custom/threestudio-gaussians2life/guidance/dynamicrafter/pretrained_models/dynamicrafter-512.ckpt"
+    ddim_steps: 40
+    ddim_eta: 1.0
+    bs: 1
+    width: 512
+    height: 320
+    num_frames: ${data.num_frames}
+    timestep_spacing: uniform
+    perframe_ae: True
+    frame_stride: 20
+
+    min_step_percent: 0.2
+    max_step_percent: 0.75
+    guidance_scale: 13
+    diffusion_scheduling: "linear"
+
+    anchor_viewpoint_sample_path: "custom/threestudio-gaussians2life/assets/sample_initial_videos/bear.mp4"
+    lambda_latent_interpolation: [ 0.6, 0.0 ]
+    latent_interpolation_type: "previous"
+
+checkpoint:
+  save_last: true
+  save_top_k: 0 #-1
+  every_n_train_steps: ${trainer.max_steps}

@@ -1,0 +1,116 @@
+name: "gardenvase"
+tag: "${rmspace:${system.prompt_processor.prompt},_}"
+exp_root_dir: "outputs"
+seed: 0
+
+trainer:
+  max_steps: 13
+  log_every_n_steps: 1
+  num_sanity_val_steps: 0
+  val_check_interval: 1
+  enable_progress_bar: true
+  precision: 32
+
+data_type: "4dgs-multi-view-sample-once-datamodule"
+data:
+  height: 320
+  width: 512
+  num_frames: 8
+  eval_frames: 16
+  eval_height: 640
+  eval_width: 1024
+  test_height: 1080
+  test_width: 1920
+  test_extension: 1.5
+
+  azimuth_range: [ -180., 180. ]
+  elevation_range: [ -5., 20. ]
+  distance_range: [ -0.1, 0.1 ]
+  std_azimuth: 0.05
+  std_elevation: 0.05
+  std_distance: 0.01
+  fovx_range: [ 60, 60 ]
+  fovy_range: [ 40, 40 ]
+  eval_fovx_deg: 60
+  eval_fovy_deg: 40
+  eval_radius: 0.0
+
+  camera_up: [ 0., 0., 1. ]
+  camera_lookat: [ 0., 0., 0. ]
+  anchor_view: [ -1.4, 2.0, 1.0 ]
+
+  num_views_per_direction: 6
+  num_optimization_steps_before_resampling: 0
+  random_views: True
+
+system_type: "gauss-trajectory-4d-system"
+system:
+  debug: true
+  geometry_type: "gaussian-splatting-trajectories"
+  back_ground_color: [ 1.0, 1.0, 1.0 ]
+  geometry:
+    sh_degree: 0
+    geometry_convert_from: "custom/threestudio-gaussians2life/assets/sample_data/gardenvase.ply"
+    mask_path: "custom/threestudio-gaussians2life/assets/sample_data/mask_gardenvase.pt"
+    num_frames: ${data.num_frames}
+    update_scale: False
+    update_rotation: True
+    anchor_view_multiplier: 2
+    num_nearest_neighbors: 125
+    num_nearest_neighbors_inference: 250
+    knn_weighting: 0.0
+
+    box_rot_x: 10
+    box_rot_y: 270
+    box_rot_z: 0
+
+    inference_mode: "rigid"
+
+  material_type: "no-material" # unused
+  material:
+    n_output_dims: 0
+
+  background_type: "solid-color-background" # unused
+
+  renderer_type: "diff-gaussian-rasterizer-dynamic"
+  renderer:
+    debug: false
+    invert_bg_prob: 1.0
+
+  prompt_processor_type: ""
+  prompt_processor:
+    prompt: ???
+
+  guidance_type: "dynamicrafter-guidance"
+  guidance:
+    model_config: "custom/threestudio-gaussians2life/guidance/dynamicrafter/configs/inference_512_v1.0.yaml"
+    ckpt_path: "custom/threestudio-gaussians2life/guidance/dynamicrafter/pretrained_models/dynamicrafter-512.ckpt"
+    ddim_steps: 40
+    ddim_eta: 1.0
+    bs: 1
+    width: 512
+    height: 320
+    num_frames: ${data.num_frames}
+    timestep_spacing: uniform
+    perframe_ae: True
+    frame_stride: 10
+
+    min_step_percent: 0.1
+    max_step_percent: 0.75
+    guidance_scale: 7.5
+    diffusion_scheduling: "linear"
+
+    anchor_viewpoint_sample_path: "custom/threestudio-gaussians2life/assets/sample_initial_videos/gardenvase.mp4"
+    lambda_latent_interpolation: [ 0.5, 0.0 ]
+    latent_interpolation_type: "previous"
+
+  loggers:
+    wandb:
+      enable: false
+      project: "threestudio"
+      name: None
+
+checkpoint:
+  save_last: true
+  save_top_k: 0 #-1
+  every_n_train_steps: ${trainer.max_steps}
