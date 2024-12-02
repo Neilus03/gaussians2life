@@ -6,7 +6,7 @@
 
 Proceedings of the International Conference on 3D Vision (**3DV**), 2025
 
-[**Project Website**](https://wimmerth.github.io/gaussians2life.html) | [PDF](https://arxiv.org/pdf/)
+[**Project Website**](https://wimmerth.github.io/gaussians2life.html) | [PDF](https://arxiv.org/pdf/2411.19233)
 
 ---
 
@@ -38,7 +38,7 @@ threestudio.
 ```
 git clone https://github.com/threestudio-project/threestudio.git
 cd threestudio/custom/
-git clone https://github.com/wimmerth/gaussians2life.git
+git clone --recursive https://github.com/wimmerth/gaussians2life.git
 mamba create -n gaussians2life python=3.10
 mamba activate gaussians2life
 cd gaussians2life
@@ -56,7 +56,7 @@ pip install ./simple-knn
 ### Download of pretrained DynamiCrafter model
 
 ```
-cd guidance
+cd guidance/dynamicrafter
 mkdir pretrained_models
 cd pretrained_models
 huggingface-cli download Doubiiu/DynamiCrafter_512 model.ckpt --local-dir ./
@@ -73,5 +73,5 @@ from the threestudio directory to reproduce the results, e.g., the bear scene.
 
 ```
 gpu=0
-python launch.py --config custom/threestudio-gaussians2life/configs/bear.yaml --train --gpu $gpu system.prompt_processor.prompt="bear statue turns its head, static camera"
+python launch.py --config custom/gaussians2life/configs/bear.yaml --train --gpu $gpu system.prompt_processor.prompt="bear statue turns its head, static camera"
 ```

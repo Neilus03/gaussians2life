@@ -367,15 +367,6 @@ class DynamiCrafterGuidance(BaseObject):
                     rgb_prev = transform_video_with_homography(rgb_prev, H)
                 else:
                     raise ValueError(f"Unknown warping mode: {self.cfg.warping_mode}")
-
-            from ..utils import DEBUG
-            if DEBUG:
-                video = rgb_prev.permute(0, 2, 3, 1).cpu().numpy()
-                video = (video * 255).astype(np.uint8)
-                import imageio
-                imageio.mimsave(f"outputs/it{kwargs['view_index']}-cond.gif", video, fps=8)
-
-
             elif (hasattr(self, "anchor_guidance_output") and self.anchor_guidance_output is not None
                   and self.cfg.latent_interpolation_type == "anchor"):
                 rgb_prev = self.anchor_guidance_output[0].permute(1, 0, 2, 3)

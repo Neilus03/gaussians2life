@@ -50,7 +50,7 @@ system:
   last_step_rigid: False
   geometry:
     sh_degree: 0
-    geometry_convert_from: "custom/threestudio-gaussians2life/assets/sample_data/bear.ply"
+    geometry_convert_from: "custom/gaussians2life/assets/sample_data/bear.ply"
     num_frames: ${data.num_frames}
     update_scale: False
     update_rotation: True
@@ -59,7 +59,7 @@ system:
     num_nearest_neighbors_inference: 250
     knn_weighting: 0.0
 
-    mask_path: "custom/threestudio-gaussians2life/assets/sample_data/mask_bear.pt"
+    mask_path: "custom/gaussians2life/assets/sample_data/mask_bear.pt"
     box_rot_x: -5
     box_rot_y: 130
     box_rot_z: 90
@@ -83,8 +83,8 @@ system:
 
   guidance_type: "dynamicrafter-guidance"
   guidance:
-    model_config: "custom/threestudio-gaussians2life/guidance/dynamicrafter/configs/inference_512_v1.0.yaml"
-    ckpt_path: "custom/threestudio-gaussians2life/guidance/dynamicrafter/pretrained_models/dynamicrafter-512.ckpt"
+    model_config: "custom/gaussians2life/guidance/dynamicrafter/configs/inference_512_v1.0.yaml"
+    ckpt_path: "custom/gaussians2life/guidance/dynamicrafter/pretrained_models/dynamicrafter-512.ckpt"
     ddim_steps: 40
     ddim_eta: 1.0
     bs: 1
@@ -100,7 +100,7 @@ system:
     guidance_scale: 13
     diffusion_scheduling: "linear"
 
-    anchor_viewpoint_sample_path: "custom/threestudio-gaussians2life/assets/sample_initial_videos/bear.mp4"
+    anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/bear.mp4"
     lambda_latent_interpolation: [ 0.6, 0.0 ]
     latent_interpolation_type: "previous"
 

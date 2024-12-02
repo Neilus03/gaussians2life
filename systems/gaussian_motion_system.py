@@ -119,7 +119,6 @@ class GaussTo4D(BaseLift3DSystem):
         prompt_utils = self.prompt_utils
         start = time.time()
         out = self(batch)
-        self.save_video(out, self.actual_step)
         dprint(f"0) Forward time: {time.time() - start:.4f}")
         batch["num_frames"] = self.cfg.geometry["num_frames"]
 
@@ -130,10 +129,6 @@ class GaussTo4D(BaseLift3DSystem):
                 guidance_inp, prompt_utils, **batch, rgb_as_latents=False, zero_timestep=self.geometry.zero_timestep
             )
         dprint(f"1) Guidance time: {time.time() - start:.4f}")
-
-        start = time.time()
-        self.save_video(self.guidance.diffusion_output[0].permute(1, 2, 3, 0), f"{self.actual_step}-diff")
-        dprint(f"1.1) Saving guidance video: {time.time() - start:.4f}, step: {self.actual_step}")
 
         guidance_video = self.guidance.diffusion_output.permute(0, 2, 1, 3, 4)
 
