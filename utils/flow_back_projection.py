@@ -181,6 +181,7 @@ class FlowBackProjection:
         H, W = video.size(-2), video.size(-1)
 
         # Compute depth per frame
+        print("DEBUG: Video shape passed to get_depth:", video[0].shape) # Debugging line as when trying inference failed here.
         depth, confidence = self.get_depth(video[0])
 
         # Compute point tracks
