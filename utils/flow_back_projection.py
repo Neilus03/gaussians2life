@@ -2,7 +2,7 @@ import torch
 
 from scipy.special import erfinv
 import numpy as np
-
+import torch.nn.functional as F
 
 def sample_points_dense_middle(n_points, start, end):
     # Generates sample points along a line with denser distribution in the middle using a Gaussian-like transformation.
@@ -129,14 +129,52 @@ class FlowBackProjection:
 
     def get_depth(self, video):
         """
-        Predict depth for video (per-frame metric depth prediction).
+        Predict depth for video (per-frame metric depth prediction), processing frame-by-frame.
 
         :param video: tensor of shape (T, 3, H, W) with values in [0, 255]
         :return: tuple of tensors (pred_depth, pred_depth_confidence) with shapes (T, H, W) and (T, H, W)
         """
-        with torch.no_grad():
-            output = self.depth_model.infer(video, self.camera_intrinsics[None].repeat(video.size(0), 1, 1))
-        return output["depth"].squeeze(1), output["confidence"].squeeze(1)
+        num_frames, _, original_H, original_W = video.shape
+        device = video.device
+        all_pred_depth = []
+        all_pred_confidence = []
+
+        expected_H, expected_W = 364, 574 # Keep the resize target for now
+
+        single_intrinsics = self.camera_intrinsics[None].to(device) # Shape [1, 3, 3]
+
+        for t in range(num_frames):
+            frame = video[t:t+1] # Get single frame, keep batch dim: [1, 3, H, W]
+
+            # Resize input frame
+            frame_resized = F.interpolate(frame, size=(expected_H, expected_W), mode='bilinear', align_corners=False)
+
+            print(f"DEBUG: Inferring depth for frame {t}/{num_frames}, input shape: {frame_resized.shape}, intrinsics shape: {single_intrinsics.shape}")
+
+            with torch.no_grad():
+                # Pass single frame and single intrinsic matrix
+                try:
+                    # It expects batch size of 1 for intrinsics if input batch is 1
+                    output = self.depth_model.infer(frame_resized, single_intrinsics)
+                except Exception as e:
+                    print(f"ERROR during UniDepth infer for frame {t}: {e}")
+                    # Add dummy outputs to avoid breaking the loop, or re-raise
+                    output = {"depth": torch.zeros(1, 1, expected_H, expected_W, device=device),
+                            "confidence": torch.zeros(1, 1, expected_H, expected_W, device=device)}
+
+
+            # Resize output depth and confidence back to the original video size
+            pred_depth_t = F.interpolate(output["depth"], size=(original_H, original_W), mode='bilinear', align_corners=False)
+            pred_confidence_t = F.interpolate(output["confidence"], size=(original_H, original_W), mode='bilinear', align_corners=False)
+
+            all_pred_depth.append(pred_depth_t.squeeze(0)) # Remove batch dim
+            all_pred_confidence.append(pred_confidence_t.squeeze(0)) # Remove batch dim
+
+        # Stack results along the time dimension
+        final_pred_depth = torch.stack(all_pred_depth, dim=0)       # Shape [T, 1, H, W] -> [T, H, W] after squeeze
+        final_pred_confidence = torch.stack(all_pred_confidence, dim=0) # Shape [T, 1, H, W] -> [T, H, W] after squeeze
+
+        return final_pred_depth.squeeze(1), final_pred_confidence.squeeze(1) # Ensure shape is [T, H, W]
 
     def get_point_tracks(self, video, timestep=0, **kwargs):
         """
