@@ -6,6 +6,9 @@ from threestudio.systems.base import BaseLift3DSystem
 from threestudio.utils.typing import *
 from threestudio.utils.misc import get_device
 
+import imageio
+import os
+
 import time
 from ..utils import set_debug, dprint, FlowBackProjection, build_intrinsics
 
@@ -129,8 +132,60 @@ class GaussTo4D(BaseLift3DSystem):
                 guidance_inp, prompt_utils, **batch, rgb_as_latents=False, zero_timestep=self.geometry.zero_timestep
             )
         dprint(f"1) Guidance time: {time.time() - start:.4f}")
+        
+        # Save the generated guidance video for debugging
+        if batch["view_index"] in self.guidance.output_stack:
+            try:
+                # Get the video tensor (B, C, T, H, W) with values in [0, 1]
+                guidance_video_to_save = self.guidance.output_stack[batch["view_index"]]
+
+                # Format for saving: (T, H, W, C), uint8, CPU
+                formatted_video = (guidance_video_to_save[0].permute(1, 2, 3, 0) * 255).byte().cpu() # T H W C
+
+                # Define save subdirectory relative to the experiment's main save path
+                relative_save_subdir = os.path.join("debug", f"guidance_view_{batch['view_index']}")
+                # Get the full path where frames will be saved
+                full_save_dir = os.path.join(self.get_save_dir(), relative_save_subdir)
+                os.makedirs(full_save_dir, exist_ok=True) # Ensure directory exists
+
+                frame_filenames = [] # Keep track of saved frame filenames
+
+                # Save individual frames first
+                for frame_idx, frame_tensor in enumerate(formatted_video):
+                    frame_filename = f"frame_{frame_idx:04d}.png"
+                    full_frame_path = os.path.join(full_save_dir, frame_filename)
+                    # Use the system's save_image to handle path logic correctly (saves relative to get_save_dir())
+                    self.save_image(
+                       os.path.join(relative_save_subdir, frame_filename), # Path relative to main save dir
+                       frame_tensor # Expects H W C
+                    )
+                    frame_filenames.append(full_frame_path) # Store the full path for imageio
+
+                # --- Manually compile the saved frames into a GIF ---
+                gif_filename = f"guidance_video_view_{batch['view_index']}_step{self.true_global_step}.gif"
+                full_gif_path = os.path.join(full_save_dir, gif_filename)
+
+                frames_for_gif = []
+                for fname in frame_filenames:
+                     if os.path.exists(fname): # Check if frame was actually saved
+                          frames_for_gif.append(imageio.v2.imread(fname))
+                     else:
+                          print(f"Warning: Frame not found for GIF compilation: {fname}")
+
+
+                if frames_for_gif: # Only proceed if we have frames
+                    # Use imageio v2 API
+                    imageio.v2.mimsave(full_gif_path, frames_for_gif, duration=(1000 / 8), loop=0) # fps=8 -> duration=125ms=1000/8
+                    dprint(f"Saved guidance video frames to {full_save_dir} and compiled GIF to {full_gif_path}")
+                else:
+                    print(f"Warning: No frames found to compile GIF for view {batch['view_index']}.")
+                # --- End of manual compilation ---
+
+            except Exception as e:
+                print(f"WARNING: Failed to save guidance video/GIF for view {batch['view_index']}. Error: {e}")
 
         guidance_video = self.guidance.diffusion_output.permute(0, 2, 1, 3, 4)
+        
 
         start = time.time()
         # find timestep which best aligns with no deformation timestep

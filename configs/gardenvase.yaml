@@ -103,6 +103,7 @@ system:
     anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/gardenvase.mp4"
     lambda_latent_interpolation: [ 0.5, 0.0 ]
     latent_interpolation_type: "previous"
+    
 
   loggers:
     wandb:
