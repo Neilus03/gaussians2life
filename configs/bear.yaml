@@ -48,6 +48,7 @@ system:
   geometry_type: "gaussian-splatting-trajectories"
   back_ground_color: [ 1.0, 1.0, 1.0 ]
   last_step_rigid: False
+  
   geometry:
     sh_degree: 0
     geometry_convert_from: "custom/gaussians2life/assets/sample_data/bear.ply"

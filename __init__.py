@@ -3,3 +3,6 @@ from .geometry import gaussian_4d_motion
 from .data import multiview_sampling_once
 from .renderer import diff_gaussian_rasterizer
 from .guidance import dynamicrafter_guidance, dynamicrafter_prompt_processor
+
+#trying to add ltx support
+from .guidance import ltx_video_guidance

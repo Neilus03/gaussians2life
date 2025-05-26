@@ -10,3 +10,9 @@
 [submodule "guidance/dynamicrafter"]
 	path = guidance/dynamicrafter
 	url = https://github.com/Doubiiu/DynamiCrafter
+[submodule "LTX-Video"]
+	path = LTX-Video
+	url = https://github.com/Lightricks/LTX-Video.git
+[submodule "guidance/LTX-Video"]
+	path = guidance/LTX-Video
+	url = https://github.com/Lightricks/LTX-Video.git
