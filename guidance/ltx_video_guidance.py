@@ -5,6 +5,7 @@ per‑view cache, warping, `pseudo_loss` contract) but swaps the actual video
 synthesis backend.
 """
 from __future__ import annotations
+import yaml
 
 # --- standard ----------------------------------------------------------------
 from dataclasses import dataclass
@@ -106,13 +107,15 @@ class LTXVideoGuidance(BaseObject):
         assert os.path.exists(self.cfg.ckpt_path), (
             "ckpt_path does not exist: " + self.cfg.ckpt_path
         )
+        with open(self.cfg.pipeline_config, "r") as f:
+            pipe_cfg = yaml.safe_load(f)
 
         # build pipeline exactly like LTX reference helper
         self.pipeline = create_ltx_video_pipeline(
             ckpt_path=self.cfg.ckpt_path,
-            precision="mixed_precision",
-            text_encoder_model_name_or_path=None,  # pulled from YAML internally
-            sampler=None,
+            precision=pipe_cfg.get("precision", "mixed_precision"),
+            text_encoder_model_name_or_path=pipe_cfg.get("text_encoder_model_name_or_path"),
+            sampler=pipe_cfg.get("sampler", None),
             device=self.device,
         )
         self.pipeline.eval()
