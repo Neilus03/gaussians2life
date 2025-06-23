@@ -263,6 +263,13 @@ class DynamiCrafterGuidance(BaseObject):
         zero_timestep: int = 0,
         **kwargs,
     ):
+        
+         # Clear any stale debug videos from the previous step
+        if hasattr(self, 'pre_warped_video_output'):
+            delattr(self, 'pre_warped_video_output')
+        if hasattr(self, 'post_warped_video_output'):
+            delattr(self, 'post_warped_video_output')
+            
         if "clear_previous" in kwargs and kwargs["clear_previous"]:
             self.output_stack = {}
             self.first_frames = {}
@@ -355,11 +362,17 @@ class DynamiCrafterGuidance(BaseObject):
                 rgb_prev = self.output_stack[kwargs["reference_view"]][0].permute(1, 0, 2, 3)
                 dprint(f"Use reference view {kwargs['reference_view']} for guidance for {kwargs['view_index']}")
 
+                self.pre_warped_video_output = rgb_prev.clone().unsqueeze(0) # Shape: (1, T, C, H, W)
+
                 if self.cfg.warping_mode == "flow":
                     from ..utils import warp_video_with_flow
+                    self.pre_warped_video_output = rgb_prev.clone().unsqueeze(0) # Store pre-warped video (1, T, C, H, W)
                     rgb_prev = warp_video_with_flow(self.first_frames[kwargs["reference_view"]],
                                                     rgb[0, :, zero_timestep].permute(1, 2, 0).detach().cpu().numpy(),
                                                     rgb_prev, self.first_frame_indices[kwargs["reference_view"]])
+                    # warp_video_with_flow returns (T, C, H, W) tensor, add batch dim
+                    self.post_warped_video_output = rgb_prev.clone().unsqueeze(0) # Shape: (1, T, C, H, W)
+                
                 elif self.cfg.warping_mode == "homography":
                     from ..utils import transform_video_with_homography, find_homography
                     H = find_homography(self.first_frames[kwargs["reference_view"]],
@@ -401,6 +414,10 @@ class DynamiCrafterGuidance(BaseObject):
                                                               **kwargs).detach()
             else:
                 self.diffusion_output = self.compute_denoised(latents, cond, uc, **kwargs).detach()
+                
+            # Store the raw video output before any processing
+            self.raw_video_output = self.diffusion_output.clone()
+
             if "view_index" in kwargs:
                 self.output_stack[kwargs["view_index"]] = self.diffusion_output
                 self.first_frames[kwargs["view_index"]] = rgb[0, :, zero_timestep].permute(1, 2,
