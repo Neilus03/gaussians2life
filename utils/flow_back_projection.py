@@ -211,7 +211,13 @@ class FlowBackProjection:
         :param video: tensor of shape (1, T, 3, H, W) with values in [0, 1]
         :param init_depth: tensor of shape (H, W)
         :param kwargs: additional arguments for the back-projection
-        :return: tensor of shape (T, N, 3) with N = point_tracking_grid_size^2; 3D motion of tracked points in camera space
+        :return: tuple of (points_3d, depth_confidence_per_point, depth, confidence, pred_tracks, pred_visibility)
+            - points_3d: tensor of shape (T, N, 3) with N = point_tracking_grid_size^2; 3D motion of tracked points in camera space
+            - depth_confidence_per_point: tensor of shape (T, N) with confidence values for each point
+            - depth: tensor of shape (T, H, W) with predicted depth maps
+            - confidence: tensor of shape (T, H, W) with confidence values for depth predictions
+            - pred_tracks: tensor of shape (B, T, N, 2) with predicted point tracks
+            - pred_visibility: tensor of shape (B, T, N) with visibility flags for each point
         """
 
         # Transform video to [0, 255]
@@ -285,4 +291,4 @@ class FlowBackProjection:
         points_3d = torch.cat((angles_points, depth_points), dim=2)  # T N 3
         points_3d = spherical_zbuffer_to_euclidean(points_3d)  # T N 3
 
-        return points_3d, depth_confidence_per_point
+        return points_3d, depth_confidence_per_point, depth, confidence, pred_tracks, pred_visibility
