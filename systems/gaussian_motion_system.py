@@ -8,6 +8,11 @@ from threestudio.utils.misc import get_device
 
 import imageio
 import os
+import numpy as np
+import cv2
+from torchvision.utils import save_image
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 import time
 from ..utils import set_debug, dprint, FlowBackProjection, build_intrinsics
@@ -26,6 +31,7 @@ class GaussTo4D(BaseLift3DSystem):
         back_ground_color: Tuple[float, float, float] = (1, 1, 1)
         debug: bool = False
         last_step_rigid: bool = False
+        save_debug_artifacts: bool = False
 
     cfg: Config
 
@@ -44,6 +50,239 @@ class GaussTo4D(BaseLift3DSystem):
 
     def configure_optimizers(self):
         return []
+
+    def _get_debug_save_dir(self, step):
+        """Get the directory for saving debug artifacts for a specific step."""
+        base_dir = os.path.join(self.get_save_dir(), "debugging_files")
+        step_dir = os.path.join(base_dir, f"step_{step}")
+        os.makedirs(step_dir, exist_ok=True)
+        return step_dir
+
+    def _save_video_as_frames_and_gif(self, video_tensor, save_dir, prefix):
+        """Save a video tensor as individual frames and a GIF."""
+        dprint(f"Input video tensor shape: {video_tensor.shape}, dtype: {video_tensor.dtype}")
+        
+        # Ensure video is in the correct format (T, C, H, W) with values in [0, 1]
+        if video_tensor.dim() == 5:  # (B, T, C, H, W)
+            video_tensor = video_tensor[0]  # Remove batch dimension
+            dprint(f"After removing batch dimension: {video_tensor.shape}")
+        if video_tensor.dim() == 4:  # (T, C, H, W)
+            video_tensor = video_tensor.permute(0, 2, 3, 1)  # (T, H, W, C)
+            dprint(f"After permuting dimensions: {video_tensor.shape}")
+        
+        # Save individual frames
+        frames_dir = os.path.join(save_dir, f"{prefix}_frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        dprint(f"Created frames directory: {frames_dir}")
+        
+        frames = []
+        for t in range(video_tensor.shape[0]):
+            frame = (video_tensor[t].cpu().numpy() * 255).astype(np.uint8)
+            frame_path = os.path.join(frames_dir, f"frame_{t:04d}.png")
+            success = cv2.imwrite(frame_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            if not success:
+                dprint(f"Failed to save frame {t} to {frame_path}")
+            frames.append(frame)
+            if t == 0:
+                dprint(f"First frame shape: {frame.shape}, dtype: {frame.dtype}, min: {frame.min()}, max: {frame.max()}")
+        
+        # Save as GIF
+        gif_path = os.path.join(save_dir, f"{prefix}.gif")
+        try:
+            imageio.mimsave(gif_path, frames, fps=8)
+            dprint(f"Saved GIF to {gif_path}")
+        except Exception as e:
+            dprint(f"Failed to save GIF: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return frames_dir, gif_path
+
+    def _save_depth_maps(self, depth_maps, confidence_maps, save_dir):
+        """Save depth maps and confidence maps as visualizations."""
+        depth_dir = os.path.join(save_dir, "depth_maps")
+        os.makedirs(depth_dir, exist_ok=True)
+        
+        # Lists to store frames for video creation
+        depth_frames = []
+        confidence_frames = []
+        
+        for t in range(depth_maps.shape[0]):
+            # Normalize depth map for visualization
+            depth_map = depth_maps[t].cpu().numpy()
+            depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
+            depth_map = (depth_map * 255).astype(np.uint8)
+            
+            # Save depth map
+            depth_path = os.path.join(depth_dir, f"depth_{t:04d}.png")
+            cv2.imwrite(depth_path, depth_map)
+            depth_frames.append(depth_map)
+            
+            # Save confidence map
+            conf_map = confidence_maps[t].cpu().numpy()
+            conf_map = (conf_map * 255).astype(np.uint8)
+            conf_path = os.path.join(depth_dir, f"confidence_{t:04d}.png")
+            cv2.imwrite(conf_path, conf_map)
+            confidence_frames.append(conf_map)
+        
+        # Save videos
+        depth_video_path = os.path.join(depth_dir, "depth_video.gif")
+        confidence_video_path = os.path.join(depth_dir, "confidence_video.gif")
+        imageio.mimsave(depth_video_path, depth_frames, fps=8)
+        imageio.mimsave(confidence_video_path, confidence_frames, fps=8)
+
+    def _save_point_tracks(self, video, tracks, visibility, save_dir):
+        """Save point tracks visualization."""
+        tracks_dir = os.path.join(save_dir, "point_tracks")
+        os.makedirs(tracks_dir, exist_ok=True)
+        
+        # Convert video to numpy for visualization
+        video_np = (video[0].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+        tracks_np = tracks[0].cpu().numpy()
+        visibility_np = visibility[0].cpu().numpy()
+        
+        # List to store frames for video creation
+        track_frames = []
+        
+        for t in range(video_np.shape[0]):
+            frame = video_np[t].copy()
+            
+            # Draw visible points
+            visible_points = tracks_np[t][visibility_np[t] > 0]
+            for point in visible_points:
+                x, y = int(point[0]), int(point[1])
+                cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
+            
+            # Save frame with tracks
+            track_path = os.path.join(tracks_dir, f"tracks_{t:04d}.png")
+            cv2.imwrite(track_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            track_frames.append(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        
+        # Save video
+        track_video_path = os.path.join(tracks_dir, "tracks_video.gif")
+        imageio.mimsave(track_video_path, track_frames, fps=8)
+
+    def _save_3d_trajectories(self, points_3d, save_dir):
+        """Save 3D trajectories as a static 3D plot visualization."""
+        traj_dir = os.path.join(save_dir, "3d_trajectories")
+        os.makedirs(traj_dir, exist_ok=True)
+        dprint(f"Saving static 3D trajectories to {traj_dir}")
+
+        points_np = points_3d.cpu().numpy() # Shape: (T, N, 3)
+
+        # Pre-calculate axis limits across all frames for a stable view in the GIF
+        x_lim = (points_np[..., 0].min(), points_np[..., 0].max())
+        y_lim = (points_np[..., 1].min(), points_np[..., 1].max())
+        z_lim = (points_np[..., 2].min(), points_np[..., 2].max())
+        
+        # Pre-calculate color limits for consistent coloring
+        # Coloring by the X-coordinate (Dimension 0)
+        color_data = points_np[..., 0] 
+        c_lim = (color_data.min(), color_data.max())
+
+        frames_for_gif = []
+
+        for t in range(points_np.shape[0]):
+            fig = plt.figure(figsize=(12, 12))
+            ax = fig.add_subplot(111, projection='3d') # This is the key line for 3D plotting
+            
+            frame_points = points_np[t] # Shape: (N, 3)
+
+            # Create the 3D scatter plot
+            sc = ax.scatter(
+                frame_points[:, 0], # X axis
+                frame_points[:, 1], # Y axis
+                frame_points[:, 2], # Z axis
+                c=frame_points[:, 0], # Color by X-axis value
+                cmap='viridis',
+                vmin=c_lim[0],
+                vmax=c_lim[1]
+            )
+            
+            # Set labels and title
+            ax.set_xlabel('Dimension 0 (X)')
+            ax.set_ylabel('Dimension 1 (Y)')
+            ax.set_zlabel('Dimension 2 (Z)')
+            ax.set_title(f'Frame {t} - 3D Anchor Trajectories')
+            
+            # Set consistent axis limits
+            ax.set_xlim(x_lim)
+            ax.set_ylim(y_lim)
+            ax.set_zlim(z_lim)
+            
+            # Add a color bar
+            plt.colorbar(sc, ax=ax, shrink=0.5, aspect=10, label='Dimension 0 Value')
+            
+            # Save the individual frame
+            frame_path = os.path.join(traj_dir, f"frame_{t:04d}.png")
+            plt.savefig(frame_path)
+            plt.close(fig) # Close the figure to free up memory
+
+            # Read the saved image to be added to the GIF
+            frame_img = imageio.v2.imread(frame_path)
+            frames_for_gif.append(frame_img)
+        
+        # Save the collected frames as a GIF
+        gif_path = os.path.join(traj_dir, "trajectories_3d_video.gif")
+        imageio.mimsave(gif_path, frames_for_gif, fps=8)
+        dprint(f"Saved 3D trajectories GIF to {gif_path}")
+            
+    def _save_3d_trajectories_interactive(self, points_3d, save_dir):
+        """Save 3D trajectories as an interactive HTML file for each frame using Plotly."""
+        traj_dir = os.path.join(save_dir, "3d_trajectories_interactive")
+        os.makedirs(traj_dir, exist_ok=True)
+        dprint(f"Saving interactive 3D trajectories to {traj_dir}")
+
+        points_np = points_3d.cpu().numpy() # Shape: (T, N, 3)
+
+        # Pre-calculate axis limits across all frames for a stable view
+        x_lim = (points_np[..., 0].min(), points_np[..., 0].max())
+        y_lim = (points_np[..., 1].min(), points_np[..., 1].max())
+        z_lim = (points_np[..., 2].min(), points_np[..., 2].max())
+        
+        # Pre-calculate color limits
+        color_data = points_np[..., 0] # Using x-axis for color, like the original plot
+        c_lim = (color_data.min(), color_data.max())
+
+        for t in range(points_np.shape[0]):
+            frame_points = points_np[t] # Shape: (N, 3)
+
+            # Create an interactive 3D scatter plot
+            fig = go.Figure(data=[go.Scatter3d(
+                x=frame_points[:, 0],
+                y=frame_points[:, 1],
+                z=frame_points[:, 2],
+                mode='markers',
+                marker=dict(
+                    size=3,
+                    color=frame_points[:, 0],  # Color by the x-coordinate
+                    colorscale='Viridis',      # Use the same colormap
+                    cmin=c_lim[0],             # Set consistent color range
+                    cmax=c_lim[1],
+                    colorbar=dict(
+                        title="Dimension 0 (X-axis)"
+                    ),
+                    opacity=0.8
+                )
+            )])
+
+            # Update layout for title and stable axis ranges
+            fig.update_layout(
+                title=f'Interactive 3D Trajectories - Frame {t}',
+                scene=dict(
+                    xaxis=dict(title='Dimension 0', range=x_lim),
+                    yaxis=dict(title='Dimension 1', range=y_lim),
+                    zaxis=dict(title='Dimension 2', range=z_lim),
+                    aspectmode='data' # This makes the aspect ratio reflect the data scales
+                ),
+                margin=dict(r=20, b=10, l=10, t=40)
+            )
+
+            # Save to an HTML file
+            html_path = os.path.join(traj_dir, f"interactive_frame_{t:04d}.html")
+            fig.write_html(html_path)
+
+        dprint(f"Finished saving {points_np.shape[0]} interactive HTML files.")
 
     def forward(self, batch: Dict[str, Any], testing=False) -> Dict[str, Any]:
         if self.flow_back_projection is None:
@@ -110,7 +349,6 @@ class GaussTo4D(BaseLift3DSystem):
         super().on_fit_start()
 
     def training_step(self, batch, batch_idx):
-
         self.actual_step += 1
 
         if hasattr(self.guidance, "update_t_w"):
@@ -133,6 +371,50 @@ class GaussTo4D(BaseLift3DSystem):
             )
         dprint(f"1) Guidance time: {time.time() - start:.4f}")
         
+        # Immediately clone the pristine, raw video from the guidance module
+        # The output is (B, C, T, H, W). We need (B, T, C, H, W) for the saver.
+        raw_guidance_video_for_saving = self.guidance.diffusion_output.clone().permute(0, 2, 1, 3, 4)
+
+        # Save the raw video if debug artifacts are enabled
+        if self.cfg.save_debug_artifacts:
+            save_dir = self._get_debug_save_dir(self.actual_step)
+            self._save_video_as_frames_and_gif(raw_guidance_video_for_saving, save_dir, "raw_guidance_video")
+            dprint(f"Saved CLEAN raw guidance video for step {self.actual_step}")
+        
+        # Save the raw video from DynamicRafter if available
+        if hasattr(self.guidance, 'raw_video') and self.guidance.raw_video is not None:
+            try:
+                save_dir = self._get_debug_save_dir(self.actual_step)
+                raw_video_dir = os.path.join(save_dir, "raw_video")
+                os.makedirs(raw_video_dir, exist_ok=True)
+                
+                # Save raw video as frames and GIF
+                raw_video = self.guidance.raw_video  # Should be in format (B, T, C, H, W) with values in [0, 1]
+                dprint(f"Raw video shape: {raw_video.shape}, dtype: {raw_video.dtype}, min: {raw_video.min().item():.3f}, max: {raw_video.max().item():.3f}")
+                frames_dir, gif_path = self._save_video_as_frames_and_gif(raw_video, raw_video_dir, "raw")
+                dprint(f"Saved raw video frames to {frames_dir} and GIF to {gif_path}")
+                
+                # Save v_s-1 (pre-warped video)
+                if hasattr(self.guidance, 'pre_warped_video_output'):       
+                    # Shape is already (B, T, C, H, W)
+                    pre_warped_for_saving = self.guidance.pre_warped_video_output.clone()
+                    self._save_video_as_frames_and_gif(pre_warped_for_saving, save_dir, "v_s-1-pre_warp")
+                    dprint(f"Saved PRE-WARPED video for step {self.actual_step}")
+                
+                # Save v'_s-1 (post-warped video)
+                if hasattr(self.guidance, 'post_warped_video_output'):
+                    # Shape is already (B, T, C, H, W)
+                    post_warped_for_saving = self.guidance.post_warped_video_output.clone()
+                    self._save_video_as_frames_and_gif(post_warped_for_saving, save_dir, "v_s-1-post_warp")
+                    dprint(f"Saved POST-WARPED video for step {self.actual_step}")
+                        
+            except Exception as e:
+                print(f"WARNING: Failed to save raw video. Error: {e} or")
+                print(f"WARNING: Failed to save pre-warped video. Error: {e} or")
+                print(f"WARNING: Failed to save post-warped video. Error: {e}")
+                import traceback
+                traceback.print_exc()
+        
         # Save the generated guidance video for debugging
         if batch["view_index"] in self.guidance.output_stack:
             try:
@@ -148,7 +430,7 @@ class GaussTo4D(BaseLift3DSystem):
                 full_save_dir = os.path.join(self.get_save_dir(), relative_save_subdir)
                 os.makedirs(full_save_dir, exist_ok=True) # Ensure directory exists
 
-                frame_filenames = [] # Keep track of saved frame filenames
+                frame_filenames = [] # Keep track of saved frame filenames 
 
                 # Save individual frames first
                 for frame_idx, frame_tensor in enumerate(formatted_video):
@@ -186,7 +468,6 @@ class GaussTo4D(BaseLift3DSystem):
 
         guidance_video = self.guidance.diffusion_output.permute(0, 2, 1, 3, 4)
         
-
         start = time.time()
         # find timestep which best aligns with no deformation timestep
         static_view = out["comp_rgb"][self.geometry.zero_timestep].permute(2, 0, 1)
@@ -195,10 +476,35 @@ class GaussTo4D(BaseLift3DSystem):
         dprint(f"2) Find timestep time: {time.time() - start:.4f}, timestep: {timestep}")
 
         start = time.time()
-        trajectories, depth_confidence = self.flow_back_projection.back_project(
+        trajectories, depth_confidence, depth_maps, confidence_maps, pred_tracks, pred_visibility = self.flow_back_projection.back_project(
             guidance_video, out["rendered_depth"][self.geometry.zero_timestep, 0], timestep=timestep
         )
         dprint(f"3) Back projection time: {time.time() - start:.4f}")
+
+        # Save debug artifacts if enabled
+        if self.cfg.save_debug_artifacts:
+            save_dir = self._get_debug_save_dir(self.actual_step)
+            
+            # Save static view
+            static_view_path = os.path.join(save_dir, "static_view.png")
+            save_image(static_view, static_view_path)
+            
+            # Save guidance video (this will now show the artifacts, which is good for debugging the tracker!)
+            self._save_video_as_frames_and_gif(guidance_video, save_dir, "processed_guidance_video_with_artifacts")
+            
+            
+            
+            # Save depth maps and confidence maps
+            self._save_depth_maps(depth_maps, confidence_maps, save_dir)
+            
+            # Save point tracks visualization
+            self._save_point_tracks(guidance_video, pred_tracks, pred_visibility, save_dir)
+            
+            # Save 3D trajectories
+            self._save_3d_trajectories(trajectories, save_dir)
+            
+            # Save 3D trajectories 
+            self._save_3d_trajectories_interactive(trajectories, save_dir)
 
         start = time.time()
         self.geometry.register_trajectories(trajectories, out["extrinsics"][0], depth_confidence, timestep)
