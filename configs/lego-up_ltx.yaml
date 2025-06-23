@@ -1,7 +1,7 @@
 # -------------------------------------------------------------------- #
-#  Gaussians-to-Life — Bear scene, LTX-Video guidance
+#  Gaussians-to-Life — lego-up scene, LTX-Video guidance
 # -------------------------------------------------------------------- #
-name: "bear_ltx"
+name: "lego-up_ltx"
 tag: "${rmspace:${system.prompt_processor.prompt},_}"
 exp_root_dir: "outputs_ltx"
 seed: 0
@@ -60,7 +60,7 @@ system:
 
   geometry:
     sh_degree: 0
-    geometry_convert_from: "custom/gaussians2life/assets/sample_data/bear.ply"
+    geometry_convert_from: "custom/gaussians2life/assets/sample_data/kitchenlego.ply"
     num_frames: ${data.num_frames}
     update_scale:      false
     update_rotation:   true
@@ -68,10 +68,8 @@ system:
     anchor_view_multiplier:             2
     num_nearest_neighbors_inference:   250
     knn_weighting: 0.0
-    mask_path: "custom/gaussians2life/assets/sample_data/mask_bear.pt"
-    box_rot_x: -5
-    box_rot_y: 130
-    box_rot_z: 90
+    mask_box: [ [ -1.0491, 1.4259, 2.0784 ],[ -0.4617, 2.5713, 0.6840 ],[ -0.2292, 1.2610, 2.2884 ],[ -1.0424, 0.6289, 1.4265 ],[ 0.3649, 1.6094, 0.2421 ],[ -0.2225, 0.4640, 1.6365 ],[ -0.4550, 1.7743, 0.0321 ],[ 0.3583, 2.4064, 0.8940 ] ]
+    box_rot_x: 90
     inference_mode: "displacement"
 
   material_type: "no-material"
@@ -102,8 +100,7 @@ system:
 
     prompt:           ""          # sbatch supplies
     negative_prompt:  "worst quality, low quality, blurry, inconsistent motion, jittery, distorted"
-    guidance_scale:   3.5
-    image_cond_noise_scale: 0.0
+    guidance_scale:   7.5
 
     height:           ${data.height}
     width:            ${data.width}

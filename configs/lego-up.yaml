@@ -46,6 +46,7 @@ data:
 system_type: "gauss-trajectory-4d-system"
 system:
   debug: true
+  save_debug_artifacts: true
   geometry_type: "gaussian-splatting-trajectories"
   back_ground_color: [ 1.0, 1.0, 1.0 ]
   last_step_rigid: True
@@ -99,7 +100,8 @@ system:
     guidance_scale: 13
     diffusion_scheduling: "linear"
 
-    anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/lego-up.mp4"
+    #anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/lego-up.mp4"
+    anchor_viewpoint_sample_path: ""
     lambda_latent_interpolation: [ 0.6, 0.35 ]
     latent_interpolation_type: "previous"
 

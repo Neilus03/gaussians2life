@@ -52,7 +52,7 @@ system:
     sh_degree: 0
     geometry_convert_from: "custom/gaussians2life/assets/sample_data/gardenvase.ply"
     mask_path: "custom/gaussians2life/assets/sample_data/mask_gardenvase.pt"
-    num_frames: ${data.num_frames}
+    num_frames: 17
     update_scale: False
     update_rotation: True
     anchor_view_multiplier: 2
@@ -100,7 +100,8 @@ system:
     guidance_scale: 7.5
     diffusion_scheduling: "linear"
 
-    anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/gardenvase.mp4"
+    #anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/gardenvase.mp4"
+    anchor_viewpoint_sample_path: ""
     lambda_latent_interpolation: [ 0.5, 0.0 ]
     latent_interpolation_type: "previous"
     
