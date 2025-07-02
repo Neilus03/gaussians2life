@@ -102,7 +102,7 @@ system:
 
     prompt:           ""          # sbatch supplies
     negative_prompt:  "worst quality, low quality, blurry, inconsistent motion, jittery, distorted"
-    guidance_scale:   3.5
+    guidance_scale:   1
     image_cond_noise_scale: 0.0
 
     height:           ${data.height}

@@ -15,8 +15,8 @@ data_type: "4dgs-multi-view-sample-once-datamodule"
 data:
   height: 320
   width: 512
-  num_frames: 8
-  eval_frames: 8
+  num_frames: 32
+  eval_frames: 32
   eval_height: 640
   eval_width: 1024
   test_height: 1080
@@ -100,8 +100,8 @@ system:
     guidance_scale: 13
     diffusion_scheduling: "linear"
 
-    #anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/lego-up.mp4"
-    anchor_viewpoint_sample_path: ""
+    anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/lego-off-table.mp4"
+    #anchor_viewpoint_sample_path: ""
     lambda_latent_interpolation: [ 0.6, 0.35 ]
     latent_interpolation_type: "previous"
 

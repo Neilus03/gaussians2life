@@ -21,8 +21,8 @@ data_type: "4dgs-multi-view-sample-once-datamodule"
 data:
   height: 320
   width: 512
-  num_frames: 8
-  eval_frames: 8
+  num_frames: 32
+  eval_frames: 32
   eval_height: 640
   eval_width: 1024
   test_height: 1080
@@ -54,6 +54,7 @@ data:
 system_type: "gauss-trajectory-4d-system"
 system:
   debug: true
+  save_debug_artifacts: true
   geometry_type: "gaussian-splatting-trajectories"
   back_ground_color: [1.0, 1.0, 1.0]
   last_step_rigid: false
@@ -100,14 +101,15 @@ system:
 
     prompt:           ""          # sbatch supplies
     negative_prompt:  "worst quality, low quality, blurry, inconsistent motion, jittery, distorted"
-    guidance_scale:   7.5
+    guidance_scale:   1.5
 
     height:           ${data.height}
     width:            ${data.width}
-    num_frames:       17
-    frame_rate:       16
+    num_frames:       32
+    frame_rate:       16 
 
-    anchor_viewpoint_sample_path: ""
+    #anchor_viewpoint_sample_path: ""
+    anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/lego-up_forwardfast.mp4"
 
 # -------------------------------------------------------------------- #
 #  Check-pointing
