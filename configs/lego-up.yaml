@@ -100,7 +100,7 @@ system:
     guidance_scale: 13
     diffusion_scheduling: "linear"
 
-    anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/lego-off-table.mp4"
+    anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/lego-up_forwardfast2.mp4"
     #anchor_viewpoint_sample_path: ""
     lambda_latent_interpolation: [ 0.6, 0.35 ]
     latent_interpolation_type: "previous"
