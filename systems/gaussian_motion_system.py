@@ -62,13 +62,36 @@ class GaussTo4D(BaseLift3DSystem):
         """Save a video tensor as individual frames and a GIF."""
         dprint(f"Input video tensor shape: {video_tensor.shape}, dtype: {video_tensor.dtype}")
         
-        # Ensure video is in the correct format (T, C, H, W) with values in [0, 1]
-        if video_tensor.dim() == 5:  # (B, T, C, H, W)
-            video_tensor = video_tensor[0]  # Remove batch dimension
+        # Handle different input formats
+        if video_tensor.dim() == 5:
+            # Check if it's (B, C, T, H, W) format from LTX
+            if video_tensor.shape[1] == 3 and video_tensor.shape[2] > 10:  # C=3 and T > 10 suggests (B, C, T, H, W)
+                dprint(f"Detected (B, C, T, H, W) format, converting to (B, T, C, H, W)")
+                video_tensor = video_tensor.permute(0, 2, 1, 3, 4)
+            # Now it should be (B, T, C, H, W)
+            video_tensor = video_tensor[0]  # Remove batch dimension to get (T, C, H, W)
             dprint(f"After removing batch dimension: {video_tensor.shape}")
-        if video_tensor.dim() == 4:  # (T, C, H, W)
-            video_tensor = video_tensor.permute(0, 2, 3, 1)  # (T, H, W, C)
-            dprint(f"After permuting dimensions: {video_tensor.shape}")
+        
+        if video_tensor.dim() == 4:
+            # Check if dimensions look like (C, T, H, W) instead of (T, C, H, W)
+            if video_tensor.shape[0] == 3 and video_tensor.shape[1] > 10:  # C=3 and T > 10
+                dprint(f"Detected (C, T, H, W) format, converting to (T, C, H, W)")
+                video_tensor = video_tensor.permute(1, 0, 2, 3)
+            # Now convert (T, C, H, W) to (T, H, W, C)
+            video_tensor = video_tensor.permute(0, 2, 3, 1)
+            dprint(f"After permuting to (T, H, W, C): {video_tensor.shape}")
+
+        # ensure all pixel values are in [0, 1]
+        if video_tensor.min() < 0.0:
+            # Typical range for generative models is [-1, 1]; shift to [0, 1]
+            dprint(f"Video tensor has negative values (min: {video_tensor.min():.3f}), normalizing to [0,1] range.")
+            video_tensor = (video_tensor.clamp(-1.0, 1.0) + 1.0) * 0.5
+        
+        
+        # Ensure values are in [0, 1] range
+        if video_tensor.max() > 1.0:
+            dprint(f"Video tensor has values > 1.0 (max: {video_tensor.max()}), normalizing...")
+            video_tensor = video_tensor / 255.0
         
         # Save individual frames
         frames_dir = os.path.join(save_dir, f"{prefix}_frames")
@@ -77,7 +100,14 @@ class GaussTo4D(BaseLift3DSystem):
         
         frames = []
         for t in range(video_tensor.shape[0]):
-            frame = (video_tensor[t].cpu().numpy() * 255).astype(np.uint8)
+            frame = cv2.normalize(
+                (video_tensor[t].cpu().numpy()), None,
+                alpha=0, beta=255, norm_type=cv2.NORM_MINMAX
+            ).astype(np.uint8)
+            # Ensure frame has correct shape (H, W, C) with C=3
+            if frame.shape[-1] != 3:
+                dprint(f"ERROR: Frame {t} has shape {frame.shape}, expected (H, W, 3)")
+                continue
             frame_path = os.path.join(frames_dir, f"frame_{t:04d}.png")
             success = cv2.imwrite(frame_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             if not success:
@@ -365,18 +395,44 @@ class GaussTo4D(BaseLift3DSystem):
 
         start = time.time()
         guidance_inp = out["comp_rgb"]
+        # Extract num_frames to pass as positional argument and avoid conflict
+        num_frames = batch["num_frames"]
+        batch_kwargs = {k: v for k, v in batch.items() if k != "num_frames"}
+        self.guidance.guidance_type = self.cfg.guidance_type
         with torch.no_grad():
-            self.guidance(
-                guidance_inp, prompt_utils, **batch, rgb_as_latents=False, zero_timestep=self.geometry.zero_timestep
-            )
+            if hasattr(self.guidance, 'guidance_type') and self.guidance.guidance_type == 'ltx-video-guidance':
+                self.guidance(
+                    guidance_inp, prompt_utils, num_frames, self.actual_step, self.trainer.max_steps,
+                    zero_timestep=self.geometry.zero_timestep, rgb_as_latents=False, **batch_kwargs
+                )
+            else:
+                self.guidance(
+                    guidance_inp, prompt_utils, num_frames,
+                    zero_timestep=self.geometry.zero_timestep, rgb_as_latents=False, **batch_kwargs
+                )
         dprint(f"1) Guidance time: {time.time() - start:.4f}")
         
         # Immediately clone the pristine, raw video from the guidance module
-        # The output is (B, C, T, H, W). We need (B, T, C, H, W) for the saver.
-        raw_guidance_video_for_saving = self.guidance.diffusion_output.clone().permute(0, 2, 1, 3, 4)
+        # Check the format of diffusion_output and handle accordingly
+        if hasattr(self.guidance, 'diffusion_output') and self.guidance.diffusion_output is not None:
+            raw_video = self.guidance.diffusion_output.clone()
+            dprint(f"Raw guidance video shape before processing: {raw_video.shape}")
+            
+            # LTX guidance outputs in [B, C, T, H, W] format
+            # We need [B, T, C, H, W] for the saver
+            if raw_video.dim() == 5 and raw_video.shape[1] == 3:  # Likely [B, C, T, H, W]
+                raw_guidance_video_for_saving = raw_video.permute(0, 2, 1, 3, 4)
+                dprint(f"Permuted from [B, C, T, H, W] to [B, T, C, H, W]: {raw_guidance_video_for_saving.shape}")
+            else:
+                # Assume it's already in the correct format
+                raw_guidance_video_for_saving = raw_video
+                dprint(f"Using raw video as-is with shape: {raw_guidance_video_for_saving.shape}")
+        else:
+            dprint("WARNING: No diffusion_output found in guidance module")
+            raw_guidance_video_for_saving = None
 
         # Save the raw video if debug artifacts are enabled
-        if self.cfg.save_debug_artifacts:
+        if self.cfg.save_debug_artifacts and raw_guidance_video_for_saving is not None:
             save_dir = self._get_debug_save_dir(self.actual_step)
             self._save_video_as_frames_and_gif(raw_guidance_video_for_saving, save_dir, "raw_guidance_video")
             dprint(f"Saved CLEAN raw guidance video for step {self.actual_step}")
@@ -466,8 +522,27 @@ class GaussTo4D(BaseLift3DSystem):
             except Exception as e:
                 print(f"WARNING: Failed to save guidance video/GIF for view {batch['view_index']}. Error: {e}")
 
-        guidance_video = self.guidance.diffusion_output.permute(0, 2, 1, 3, 4)
-        
+        # Prepare guidance video for processing
+        if hasattr(self.guidance, 'diffusion_output') and self.guidance.diffusion_output is not None:
+            raw_video = self.guidance.diffusion_output
+            dprint(f"Guidance video shape before processing: {raw_video.shape}")
+            
+            # LTX guidance outputs in [B, C, T, H, W] format
+            # We need [B, T, C, H, W] for processing
+            if raw_video.dim() == 5 and raw_video.shape[1] == 3:  # Likely [B, C, T, H, W]
+                guidance_video = raw_video.permute(0, 2, 1, 3, 4)
+                dprint(f"Permuted guidance video from [B, C, T, H, W] to [B, T, C, H, W]: {guidance_video.shape}")
+            else:
+                # Assume it's already in the correct format
+                guidance_video = raw_video
+                dprint(f"Using guidance video as-is with shape: {guidance_video.shape}")
+        else:
+            dprint("ERROR: No diffusion_output found in guidance module")
+            # Create a dummy tensor to avoid errors
+            guidance_video = torch.zeros(1, self.cfg.geometry["num_frames"], 3, 
+                                       out["comp_rgb"].shape[2], out["comp_rgb"].shape[3], 
+                                       device=out["comp_rgb"].device)
+
         start = time.time()
         # find timestep which best aligns with no deformation timestep
         static_view = out["comp_rgb"][self.geometry.zero_timestep].permute(2, 0, 1)
