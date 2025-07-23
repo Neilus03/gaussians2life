@@ -1,5 +1,8 @@
 from dataclasses import dataclass, field
 
+
+from threestudio.utils.ops import get_cam_info_gaussian 
+
 import threestudio
 import torch
 from threestudio.systems.base import BaseLift3DSystem
@@ -13,9 +16,16 @@ import cv2
 from torchvision.utils import save_image
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
+import torch.nn.functional as F
+
 
 import time
 from ..utils import set_debug, dprint, FlowBackProjection, build_intrinsics
+
+from lpips import LPIPS
+from ..utils.loss_utils import ssim
+
+import torch.optim as optim
 
 
 @threestudio.register("gauss-trajectory-4d-system")
@@ -33,6 +43,10 @@ class GaussTo4D(BaseLift3DSystem):
         last_step_rigid: bool = False
         save_debug_artifacts: bool = False
 
+        use_optimization: bool = False
+        optimizer: dict = field(default_factory=dict)
+        loss: dict = field(default_factory=dict)
+
     cfg: Config
 
     def configure(self) -> None:
@@ -40,17 +54,65 @@ class GaussTo4D(BaseLift3DSystem):
         self.automatic_optimization = False
         # set up geometry, material, background, renderer
         super().configure()
-        self.guidance = threestudio.find(self.cfg.guidance_type)(
-            self.cfg.guidance
-        )
-        self.prompt_utils = [self.cfg.prompt_processor.get("prompt", "")]
+        
+        # ===================================================================
+        # ============== CONDITIONAL SETUP BASED ON THE FLAG ================
+        # ===================================================================
+        
+        if self.cfg.use_optimization:
+            threestudio.info("****configuring system for OPTIMIZATION mode****")
+            
+            
+            # 1. Initialize geometry for learnable motion
+            #The number of keyframes == number of frames in the video
+            num_frames = self.cfg.geometry["num_frames"]  
+            self.geometry.initialize_learnable_motion(num_frames)
+            
+            #2. Load the target video for supervision
+            video_path = self.cfg.guidance.anchor_viewpoint_sample_path
+            if not os.path.exists(video_path) or not video_path:
+                raise ValueError(f"Anchor viewpoint sample video path not found: {video_path}")
+            
+            threestudio.info(f"Loading anchor viewpoint sample video from {video_path}")
+            reader = imageio.get_reader(video_path, 'ffmpeg')
+            
+            frames = []
+            for i, frame in enumerate(reader):
+                if i >= num_frames:
+                    break
+                frame_tensor = torch.from_numpy(frame).float() / 255.0
+                frames.append(frame_tensor)
+            
+            self.target_video_frames = torch.stack(frames, dim=0).to(self.device).permute(0, 3, 1, 2) # To T,C,H,W
+            
+            threestudio.info(f"Loaded {self.target_video_frames.shape[0]} frames for optimization. Shape: {self.target_video_frames.shape}")
+            
+            #3. Set up losses
+            
+            self.lpips_loss = LPIPS(net='vgg').to(self.device)
+            
+        else:
+            threestudio.info("***** Configuring system for INFERENCE-LIFTING mode. *****")
+            
+            self.guidance = threestudio.find(self.cfg.guidance_type)(
+                self.cfg.guidance
+            )
+            self.prompt_utils = [self.cfg.prompt_processor.get("prompt", "")]
+
+            self.flow_back_projection = None
 
         self.actual_step = -1
-        self.flow_back_projection = None
-
+        
     def configure_optimizers(self):
+        if self.cfg.use_optimization:
+            threestudio.info("Configuring Adam optimizer for motion parameters.")
+            optim_cfg = self.cfg.optimizer
+            # optimizer_class = threestudio.find(optim_cfg.optimizer_type)
+            optimizer = optim.Adam(self.geometry.get_trainable_motion_parameters(), **optim_cfg.args)
+            return optimizer
+        
         return []
-
+    
     def _get_debug_save_dir(self, step):
         """Get the directory for saving debug artifacts for a specific step."""
         base_dir = os.path.join(self.get_save_dir(), "debugging_files")
@@ -377,217 +439,311 @@ class GaussTo4D(BaseLift3DSystem):
 
     def on_fit_start(self) -> None:
         super().on_fit_start()
-
+        if self.cfg.use_optimization:
+            self.loss_history = {
+                'l1': [],
+                'lpips': [],
+                'ssim': [],
+                'total': []
+            }
+        
     def training_step(self, batch, batch_idx):
         self.actual_step += 1
-
-        if hasattr(self.guidance, "update_t_w"):
-            self.guidance.update_t_w(self.actual_step, self.trainer.max_steps)
-
-        if self.actual_step == self.trainer.max_steps - 1 and self.cfg.last_step_rigid:
-            self.geometry.cfg.inference_mode = "rigid"
-
-        prompt_utils = self.prompt_utils
-        start = time.time()
-        out = self(batch)
-        dprint(f"0) Forward time: {time.time() - start:.4f}")
-        batch["num_frames"] = self.cfg.geometry["num_frames"]
-
-        start = time.time()
-        guidance_inp = out["comp_rgb"]
-        # Extract num_frames to pass as positional argument and avoid conflict
-        num_frames = batch["num_frames"]
-        batch_kwargs = {k: v for k, v in batch.items() if k != "num_frames"}
-        self.guidance.guidance_type = self.cfg.guidance_type
-        with torch.no_grad():
-            if hasattr(self.guidance, 'guidance_type') and self.guidance.guidance_type == 'ltx-video-guidance':
-                self.guidance(
-                    guidance_inp, prompt_utils, num_frames, self.actual_step, self.trainer.max_steps,
-                    zero_timestep=self.geometry.zero_timestep, rgb_as_latents=False, **batch_kwargs
-                )
-            else:
-                self.guidance(
-                    guidance_inp, prompt_utils, num_frames,
-                    zero_timestep=self.geometry.zero_timestep, rgb_as_latents=False, **batch_kwargs
-                )
-        dprint(f"1) Guidance time: {time.time() - start:.4f}")
         
-        # Immediately clone the pristine, raw video from the guidance module
-        # Check the format of diffusion_output and handle accordingly
-        if hasattr(self.guidance, 'diffusion_output') and self.guidance.diffusion_output is not None:
-            raw_video = self.guidance.diffusion_output.clone()
-            dprint(f"Raw guidance video shape before processing: {raw_video.shape}")
+        # ===================================================================
+        # ===================== MAIN CONDITIONAL LOGIC ======================
+        # ===================================================================
+        
+        if self.cfg.use_optimization:
+            #---path 1: optimization training step ---
+            opt = self.optimizers()
+            opt.zero_grad()
             
-            # LTX guidance outputs in [B, C, T, H, W] format
-            # We need [B, T, C, H, W] for the saver
-            if raw_video.dim() == 5 and raw_video.shape[1] == 3:  # Likely [B, C, T, H, W]
-                raw_guidance_video_for_saving = raw_video.permute(0, 2, 1, 3, 4)
-                dprint(f"Permuted from [B, C, T, H, W] to [B, T, C, H, W]: {raw_guidance_video_for_saving.shape}")
-            else:
-                # Assume it's already in the correct format
-                raw_guidance_video_for_saving = raw_video
-                dprint(f"Using raw video as-is with shape: {raw_guidance_video_for_saving.shape}")
+            frame_idx = self.actual_step % self.target_video_frames.shape[0]
+            time_t = float(frame_idx) / (self.target_video_frames.shape[0] - 1) if self.target_video_frames.shape[0] > 1 else 0.0
+            from ..geometry.gaussian_4d_motion import Camera
+            fovy = batch["fovy"][0] 
+            fovx = batch["fovx"][0] if "fovx" in batch else fovy
+            w2c, proj, cam_p = get_cam_info_gaussian(c2w=batch["c2w"][0], fovx=fovx, fovy=fovy, znear=batch.get("znear", 0.1), zfar=batch.get("zfar", 100.0))
+            viewpoint_cam = Camera(
+                FoVx = fovx,
+                FoVy = fovy,
+                image_width = batch["width"],
+                image_height = batch["height"],
+                world_view_transform = w2c,
+                full_proj_transform = proj,
+                camera_center = cam_p,
+            )
+            output = self.renderer(viewpoint_camera=viewpoint_cam, time=time_t, bg_color=self.background.env_color)
+            rendered_image = output["render"].unsqueeze(0)
+            target_image = self.target_video_frames[frame_idx].unsqueeze(0).to(rendered_image.device)
+            
+            loss_l1 = F.l1_loss(rendered_image, target_image)
+            loss_lpips = self.lpips_loss(rendered_image.clamp(0, 1), target_image.clamp(0, 1)).mean()
+            loss_ssim = 1.0 - ssim(rendered_image, target_image)
+            
+            total_loss = self.cfg.loss.lambda_l1 * loss_l1 + self.cfg.loss.lambda_lpips * loss_lpips + self.cfg.loss.lambda_ssim * loss_ssim
+            
+            self.loss_history['l1'].append(loss_l1.item())
+            self.loss_history['lpips'].append(loss_lpips.item())
+            self.loss_history['ssim'].append(loss_ssim.item())
+            self.loss_history['total'].append(total_loss.item())
+            
+            self.log("loss/l1", loss_l1, prog_bar=True)
+            self.log("loss/lpips", loss_lpips, prog_bar=True)
+            self.log("loss/ssim", loss_ssim, prog_bar=True)
+            self.log("loss/total", total_loss, prog_bar=True)
+            
+            if self.actual_step % 10 == 0 and self.actual_step > 0:
+                import matplotlib.pyplot as plt
+                
+                steps = list(range(len(self.loss_history['l1'])))
+                
+                plt.figure(figsize=(10, 6))
+                plt.plot(steps, self.loss_history['l1'], label=f"L1 (λ={self.cfg.loss.lambda_l1:.2f})")
+                plt.plot(steps, self.loss_history['lpips'], label=f"LPIPS (λ={self.cfg.loss.lambda_lpips:.2f})")
+                plt.plot(steps, self.loss_history['ssim'], label=f"SSIM (λ={self.cfg.loss.lambda_ssim:.2f})")
+                plt.plot(steps, self.loss_history['total'], label="Total")
+                plt.xlabel("Steps")
+                plt.ylabel("Loss")
+                plt.title(f"Loss Curves up to Step {self.actual_step}")
+                plt.legend()
+                plt.grid(True)
+                
+                losses_dir = os.path.join(self.get_save_dir(), "losses")
+                os.makedirs(losses_dir, exist_ok=True)
+                plot_path = os.path.join(losses_dir, "loss_plot.png")
+                plt.savefig(plot_path)
+                plt.close()
+
+            
+            self.manual_backward(total_loss)
+            opt.step()
+            
+            # After the optimizer updates the parameters, we must re-normalize the quaternions
+            # to ensure they remain valid rotations.
+            with torch.no_grad():
+                self.geometry.rotation_delta.data = F.normalize(
+                    self.geometry.rotation_delta.data, p=2, dim=-1
+                )
+
+            
+            self.log("loss/l1", loss_l1, prog_bar=True)
+            self.log("loss/lpips", loss_lpips, prog_bar=True)
+            self.log("loss/ssim", loss_ssim, prog_bar=True)
+            self.log("loss/total", total_loss, prog_bar=True)
+            
+            return {"loss": total_loss}
+        
         else:
-            dprint("WARNING: No diffusion_output found in guidance module")
-            raw_guidance_video_for_saving = None
+            # --- Path 2: Original Gaussians2Life Training Step ---
+            if hasattr(self.guidance, "update_t_w"):
+                self.guidance.update_t_w(self.actual_step, self.trainer.max_steps)
 
-        # Save the raw video if debug artifacts are enabled
-        if self.cfg.save_debug_artifacts and raw_guidance_video_for_saving is not None:
-            save_dir = self._get_debug_save_dir(self.actual_step)
-            self._save_video_as_frames_and_gif(raw_guidance_video_for_saving, save_dir, "raw_guidance_video")
-            dprint(f"Saved CLEAN raw guidance video for step {self.actual_step}")
-        
-        # Save the raw video from DynamicRafter if available
-        if hasattr(self.guidance, 'raw_video') and self.guidance.raw_video is not None:
-            try:
-                save_dir = self._get_debug_save_dir(self.actual_step)
-                raw_video_dir = os.path.join(save_dir, "raw_video")
-                os.makedirs(raw_video_dir, exist_ok=True)
-                
-                # Save raw video as frames and GIF
-                raw_video = self.guidance.raw_video  # Should be in format (B, T, C, H, W) with values in [0, 1]
-                dprint(f"Raw video shape: {raw_video.shape}, dtype: {raw_video.dtype}, min: {raw_video.min().item():.3f}, max: {raw_video.max().item():.3f}")
-                frames_dir, gif_path = self._save_video_as_frames_and_gif(raw_video, raw_video_dir, "raw")
-                dprint(f"Saved raw video frames to {frames_dir} and GIF to {gif_path}")
-                
-                # Save v_s-1 (pre-warped video)
-                if hasattr(self.guidance, 'pre_warped_video_output'):       
-                    # Shape is already (B, T, C, H, W)
-                    pre_warped_for_saving = self.guidance.pre_warped_video_output.clone()
-                    self._save_video_as_frames_and_gif(pre_warped_for_saving, save_dir, "v_s-1-pre_warp")
-                    dprint(f"Saved PRE-WARPED video for step {self.actual_step}")
-                
-                # Save v'_s-1 (post-warped video)
-                if hasattr(self.guidance, 'post_warped_video_output'):
-                    # Shape is already (B, T, C, H, W)
-                    post_warped_for_saving = self.guidance.post_warped_video_output.clone()
-                    self._save_video_as_frames_and_gif(post_warped_for_saving, save_dir, "v_s-1-post_warp")
-                    dprint(f"Saved POST-WARPED video for step {self.actual_step}")
-                        
-            except Exception as e:
-                print(f"WARNING: Failed to save raw video. Error: {e} or")
-                print(f"WARNING: Failed to save pre-warped video. Error: {e} or")
-                print(f"WARNING: Failed to save post-warped video. Error: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # Save the generated guidance video for debugging
-        if batch["view_index"] in self.guidance.output_stack:
-            try:
-                # Get the video tensor (B, C, T, H, W) with values in [0, 1]
-                guidance_video_to_save = self.guidance.output_stack[batch["view_index"]]
+            if self.actual_step == self.trainer.max_steps - 1 and self.cfg.last_step_rigid:
+                self.geometry.cfg.inference_mode = "rigid"
 
-                # Format for saving: (T, H, W, C), uint8, CPU
-                formatted_video = (guidance_video_to_save[0].permute(1, 2, 3, 0) * 255).byte().cpu() # T H W C
+            prompt_utils = self.prompt_utils
+            start = time.time()
+            out = self(batch)
+            dprint(f"0) Forward time: {time.time() - start:.4f}")
+            batch["num_frames"] = self.cfg.geometry["num_frames"]
 
-                # Define save subdirectory relative to the experiment's main save path
-                relative_save_subdir = os.path.join("debug", f"guidance_view_{batch['view_index']}")
-                # Get the full path where frames will be saved
-                full_save_dir = os.path.join(self.get_save_dir(), relative_save_subdir)
-                os.makedirs(full_save_dir, exist_ok=True) # Ensure directory exists
-
-                frame_filenames = [] # Keep track of saved frame filenames 
-
-                # Save individual frames first
-                for frame_idx, frame_tensor in enumerate(formatted_video):
-                    frame_filename = f"frame_{frame_idx:04d}.png"
-                    full_frame_path = os.path.join(full_save_dir, frame_filename)
-                    # Use the system's save_image to handle path logic correctly (saves relative to get_save_dir())
-                    self.save_image(
-                       os.path.join(relative_save_subdir, frame_filename), # Path relative to main save dir
-                       frame_tensor # Expects H W C
+            start = time.time()
+            guidance_inp = out["comp_rgb"]
+            # Extract num_frames to pass as positional argument and avoid conflict
+            num_frames = batch["num_frames"]
+            batch_kwargs = {k: v for k, v in batch.items() if k != "num_frames"}
+            self.guidance.guidance_type = self.cfg.guidance_type
+            with torch.no_grad():
+                if hasattr(self.guidance, 'guidance_type') and self.guidance.guidance_type == 'ltx-video-guidance':
+                    self.guidance(
+                        guidance_inp, prompt_utils, num_frames, self.actual_step, self.trainer.max_steps,
+                        zero_timestep=self.geometry.zero_timestep, rgb_as_latents=False, **batch_kwargs
                     )
-                    frame_filenames.append(full_frame_path) # Store the full path for imageio
-
-                # --- Manually compile the saved frames into a GIF ---
-                gif_filename = f"guidance_video_view_{batch['view_index']}_step{self.true_global_step}.gif"
-                full_gif_path = os.path.join(full_save_dir, gif_filename)
-
-                frames_for_gif = []
-                for fname in frame_filenames:
-                     if os.path.exists(fname): # Check if frame was actually saved
-                          frames_for_gif.append(imageio.v2.imread(fname))
-                     else:
-                          print(f"Warning: Frame not found for GIF compilation: {fname}")
-
-
-                if frames_for_gif: # Only proceed if we have frames
-                    # Use imageio v2 API
-                    imageio.v2.mimsave(full_gif_path, frames_for_gif, duration=(1000 / 8), loop=0) # fps=8 -> duration=125ms=1000/8
-                    dprint(f"Saved guidance video frames to {full_save_dir} and compiled GIF to {full_gif_path}")
                 else:
-                    print(f"Warning: No frames found to compile GIF for view {batch['view_index']}.")
-                # --- End of manual compilation ---
-
-            except Exception as e:
-                print(f"WARNING: Failed to save guidance video/GIF for view {batch['view_index']}. Error: {e}")
-
-        # Prepare guidance video for processing
-        if hasattr(self.guidance, 'diffusion_output') and self.guidance.diffusion_output is not None:
-            raw_video = self.guidance.diffusion_output
-            dprint(f"Guidance video shape before processing: {raw_video.shape}")
+                    self.guidance(
+                        guidance_inp, prompt_utils, num_frames,
+                        zero_timestep=self.geometry.zero_timestep, rgb_as_latents=False, **batch_kwargs
+                    )
+            dprint(f"1) Guidance time: {time.time() - start:.4f}")
             
-            # LTX guidance outputs in [B, C, T, H, W] format
-            # We need [B, T, C, H, W] for processing
-            if raw_video.dim() == 5 and raw_video.shape[1] == 3:  # Likely [B, C, T, H, W]
-                guidance_video = raw_video.permute(0, 2, 1, 3, 4)
-                dprint(f"Permuted guidance video from [B, C, T, H, W] to [B, T, C, H, W]: {guidance_video.shape}")
+            # Immediately clone the pristine, raw video from the guidance module
+            # Check the format of diffusion_output and handle accordingly
+            if hasattr(self.guidance, 'diffusion_output') and self.guidance.diffusion_output is not None:
+                raw_video = self.guidance.diffusion_output.clone()
+                dprint(f"Raw guidance video shape before processing: {raw_video.shape}")
+                
+                # LTX guidance outputs in [B, C, T, H, W] format
+                # We need [B, T, C, H, W] for the saver
+                if raw_video.dim() == 5 and raw_video.shape[1] == 3:  # Likely [B, C, T, H, W]
+                    raw_guidance_video_for_saving = raw_video.permute(0, 2, 1, 3, 4)
+                    dprint(f"Permuted from [B, C, T, H, W] to [B, T, C, H, W]: {raw_guidance_video_for_saving.shape}")
+                else:
+                    # Assume it's already in the correct format
+                    raw_guidance_video_for_saving = raw_video
+                    dprint(f"Using raw video as-is with shape: {raw_guidance_video_for_saving.shape}")
             else:
-                # Assume it's already in the correct format
-                guidance_video = raw_video
-                dprint(f"Using guidance video as-is with shape: {guidance_video.shape}")
-        else:
-            dprint("ERROR: No diffusion_output found in guidance module")
-            # Create a dummy tensor to avoid errors
-            guidance_video = torch.zeros(1, self.cfg.geometry["num_frames"], 3, 
-                                       out["comp_rgb"].shape[2], out["comp_rgb"].shape[3], 
-                                       device=out["comp_rgb"].device)
+                dprint("WARNING: No diffusion_output found in guidance module")
+                raw_guidance_video_for_saving = None
 
-        start = time.time()
-        # find timestep which best aligns with no deformation timestep
-        static_view = out["comp_rgb"][self.geometry.zero_timestep].permute(2, 0, 1)
-        per_frame_diffs = torch.abs(guidance_video[0] - static_view).mean(dim=3).mean(dim=2).mean(dim=1)
-        timestep = torch.argmin(per_frame_diffs).item()
-        dprint(f"2) Find timestep time: {time.time() - start:.4f}, timestep: {timestep}")
+            # Save the raw video if debug artifacts are enabled
+            if self.cfg.save_debug_artifacts and raw_guidance_video_for_saving is not None:
+                save_dir = self._get_debug_save_dir(self.actual_step)
+                self._save_video_as_frames_and_gif(raw_guidance_video_for_saving, save_dir, "raw_guidance_video")
+                dprint(f"Saved CLEAN raw guidance video for step {self.actual_step}")
+            
+            # Save the raw video from DynamicRafter if available
+            if hasattr(self.guidance, 'raw_video') and self.guidance.raw_video is not None:
+                try:
+                    save_dir = self._get_debug_save_dir(self.actual_step)
+                    raw_video_dir = os.path.join(save_dir, "raw_video")
+                    os.makedirs(raw_video_dir, exist_ok=True)
+                    
+                    # Save raw video as frames and GIF
+                    raw_video = self.guidance.raw_video  # Should be in format (B, T, C, H, W) with values in [0, 1]
+                    dprint(f"Raw video shape: {raw_video.shape}, dtype: {raw_video.dtype}, min: {raw_video.min().item():.3f}, max: {raw_video.max().item():.3f}")
+                    frames_dir, gif_path = self._save_video_as_frames_and_gif(raw_video, raw_video_dir, "raw")
+                    dprint(f"Saved raw video frames to {frames_dir} and GIF to {gif_path}")
+                    
+                    # Save v_s-1 (pre-warped video)
+                    if hasattr(self.guidance, 'pre_warped_video_output'):       
+                        # Shape is already (B, T, C, H, W)
+                        pre_warped_for_saving = self.guidance.pre_warped_video_output.clone()
+                        self._save_video_as_frames_and_gif(pre_warped_for_saving, save_dir, "v_s-1-pre_warp")
+                        dprint(f"Saved PRE-WARPED video for step {self.actual_step}")
+                    
+                    # Save v'_s-1 (post-warped video)
+                    if hasattr(self.guidance, 'post_warped_video_output'):
+                        # Shape is already (B, T, C, H, W)
+                        post_warped_for_saving = self.guidance.post_warped_video_output.clone()
+                        self._save_video_as_frames_and_gif(post_warped_for_saving, save_dir, "v_s-1-post_warp")
+                        dprint(f"Saved POST-WARPED video for step {self.actual_step}")
+                            
+                except Exception as e:
+                    print(f"WARNING: Failed to save raw video. Error: {e} or")
+                    print(f"WARNING: Failed to save pre-warped video. Error: {e} or")
+                    print(f"WARNING: Failed to save post-warped video. Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Save the generated guidance video for debugging
+            if batch["view_index"] in self.guidance.output_stack:
+                try:
+                    # Get the video tensor (B, C, T, H, W) with values in [0, 1]
+                    guidance_video_to_save = self.guidance.output_stack[batch["view_index"]]
 
-        start = time.time()
-        trajectories, depth_confidence, depth_maps, confidence_maps, pred_tracks, pred_visibility = self.flow_back_projection.back_project(
-            guidance_video, out["rendered_depth"][self.geometry.zero_timestep, 0], timestep=timestep
-        )
-        dprint(f"3) Back projection time: {time.time() - start:.4f}")
+                    # Format for saving: (T, H, W, C), uint8, CPU
+                    formatted_video = (guidance_video_to_save[0].permute(1, 2, 3, 0) * 255).byte().cpu() # T H W C
 
-        # Save debug artifacts if enabled
-        if self.cfg.save_debug_artifacts:
-            save_dir = self._get_debug_save_dir(self.actual_step)
-            
-            # Save static view
-            static_view_path = os.path.join(save_dir, "static_view.png")
-            save_image(static_view, static_view_path)
-            
-            # Save guidance video (this will now show the artifacts, which is good for debugging the tracker!)
-            self._save_video_as_frames_and_gif(guidance_video, save_dir, "processed_guidance_video_with_artifacts")
-            
-            
-            
-            # Save depth maps and confidence maps
-            self._save_depth_maps(depth_maps, confidence_maps, save_dir)
-            
-            # Save point tracks visualization
-            self._save_point_tracks(guidance_video, pred_tracks, pred_visibility, save_dir)
-            
-            # Save 3D trajectories
-            self._save_3d_trajectories(trajectories, save_dir)
-            
-            # Save 3D trajectories 
-            self._save_3d_trajectories_interactive(trajectories, save_dir)
+                    # Define save subdirectory relative to the experiment's main save path
+                    relative_save_subdir = os.path.join("debug", f"guidance_view_{batch['view_index']}")
+                    # Get the full path where frames will be saved
+                    full_save_dir = os.path.join(self.get_save_dir(), relative_save_subdir)
+                    os.makedirs(full_save_dir, exist_ok=True) # Ensure directory exists
 
-        start = time.time()
-        self.geometry.register_trajectories(trajectories, out["extrinsics"][0], depth_confidence, timestep)
-        dprint(f"4) Register trajectories time: {time.time() - start:.4f}")
+                    frame_filenames = [] # Keep track of saved frame filenames 
 
-        self.trainer.fit_loop.epoch_loop.manual_optimization.optim_step_progress.total.completed += 1
+                    # Save individual frames first
+                    for frame_idx, frame_tensor in enumerate(formatted_video):
+                        frame_filename = f"frame_{frame_idx:04d}.png"
+                        full_frame_path = os.path.join(full_save_dir, frame_filename)
+                        # Use the system's save_image to handle path logic correctly (saves relative to get_save_dir())
+                        self.save_image(
+                        os.path.join(relative_save_subdir, frame_filename), # Path relative to main save dir
+                        frame_tensor # Expects H W C
+                        )
+                        frame_filenames.append(full_frame_path) # Store the full path for imageio
 
-        return {"loss": torch.tensor(0.0)}
+                    # --- Manually compile the saved frames into a GIF ---
+                    gif_filename = f"guidance_video_view_{batch['view_index']}_step{self.true_global_step}.gif"
+                    full_gif_path = os.path.join(full_save_dir, gif_filename)
+
+                    frames_for_gif = []
+                    for fname in frame_filenames:
+                        if os.path.exists(fname): # Check if frame was actually saved
+                            frames_for_gif.append(imageio.v2.imread(fname))
+                        else:
+                            print(f"Warning: Frame not found for GIF compilation: {fname}")
+
+
+                    if frames_for_gif: # Only proceed if we have frames
+                        # Use imageio v2 API
+                        imageio.v2.mimsave(full_gif_path, frames_for_gif, duration=(1000 / 8), loop=0) # fps=8 -> duration=125ms=1000/8
+                        dprint(f"Saved guidance video frames to {full_save_dir} and compiled GIF to {full_gif_path}")
+                    else:
+                        print(f"Warning: No frames found to compile GIF for view {batch['view_index']}.")
+                    # --- End of manual compilation ---
+
+                except Exception as e:
+                    print(f"WARNING: Failed to save guidance video/GIF for view {batch['view_index']}. Error: {e}")
+
+            # Prepare guidance video for processing
+            if hasattr(self.guidance, 'diffusion_output') and self.guidance.diffusion_output is not None:
+                raw_video = self.guidance.diffusion_output
+                dprint(f"Guidance video shape before processing: {raw_video.shape}")
+                
+                # LTX guidance outputs in [B, C, T, H, W] format
+                # We need [B, T, C, H, W] for processing
+                if raw_video.dim() == 5 and raw_video.shape[1] == 3:  # Likely [B, C, T, H, W]
+                    guidance_video = raw_video.permute(0, 2, 1, 3, 4)
+                    dprint(f"Permuted guidance video from [B, C, T, H, W] to [B, T, C, H, W]: {guidance_video.shape}")
+                else:
+                    # Assume it's already in the correct format
+                    guidance_video = raw_video
+                    dprint(f"Using guidance video as-is with shape: {guidance_video.shape}")
+            else:
+                dprint("ERROR: No diffusion_output found in guidance module")
+                # Create a dummy tensor to avoid errors
+                guidance_video = torch.zeros(1, self.cfg.geometry["num_frames"], 3, 
+                                        out["comp_rgb"].shape[2], out["comp_rgb"].shape[3], 
+                                        device=out["comp_rgb"].device)
+
+            start = time.time()
+            # find timestep which best aligns with no deformation timestep
+            static_view = out["comp_rgb"][self.geometry.zero_timestep].permute(2, 0, 1)
+            per_frame_diffs = torch.abs(guidance_video[0] - static_view).mean(dim=3).mean(dim=2).mean(dim=1)
+            timestep = torch.argmin(per_frame_diffs).item()
+            dprint(f"2) Find timestep time: {time.time() - start:.4f}, timestep: {timestep}")
+
+            start = time.time()
+            trajectories, depth_confidence, depth_maps, confidence_maps, pred_tracks, pred_visibility = self.flow_back_projection.back_project(
+                guidance_video, out["rendered_depth"][self.geometry.zero_timestep, 0], timestep=timestep
+            )
+            dprint(f"3) Back projection time: {time.time() - start:.4f}")
+
+            # Save debug artifacts if enabled
+            if self.cfg.save_debug_artifacts:
+                save_dir = self._get_debug_save_dir(self.actual_step)
+                
+                # Save static view
+                static_view_path = os.path.join(save_dir, "static_view.png")
+                save_image(static_view, static_view_path)
+                
+                # Save guidance video (this will now show the artifacts, which is good for debugging the tracker!)
+                self._save_video_as_frames_and_gif(guidance_video, save_dir, "processed_guidance_video_with_artifacts")
+                
+                
+                
+                # Save depth maps and confidence maps
+                self._save_depth_maps(depth_maps, confidence_maps, save_dir)
+                
+                # Save point tracks visualization
+                self._save_point_tracks(guidance_video, pred_tracks, pred_visibility, save_dir)
+                
+                # Save 3D trajectories
+                self._save_3d_trajectories(trajectories, save_dir)
+                
+                # Save 3D trajectories 
+                self._save_3d_trajectories_interactive(trajectories, save_dir)
+
+            start = time.time()
+            self.geometry.register_trajectories(trajectories, out["extrinsics"][0], depth_confidence, timestep)
+            dprint(f"4) Register trajectories time: {time.time() - start:.4f}")
+
+            self.trainer.fit_loop.epoch_loop.manual_optimization.optim_step_progress.total.completed += 1
+
+            return {"loss": torch.tensor(0.0)}
 
     def save_video(self, batch_video, step):
         if isinstance(batch_video, dict):
@@ -620,6 +776,11 @@ class GaussTo4D(BaseLift3DSystem):
         )
 
     def validation_step(self, batch, batch_idx):
+        # In optimization mode, we save the full rendered video during on_validation_epoch_end
+        if self.cfg.use_optimization:
+            return
+        
+        # original g2l val logic
         start = time.time()
         batch_video = {k: v for k, v in batch.items() if k != "frame_times"}
         batch_video["frame_times"] = batch["frame_times_video"]
@@ -628,9 +789,47 @@ class GaussTo4D(BaseLift3DSystem):
         dprint(f"A) Evaluation time: {time.time() - start:.4f}")
 
     def on_validation_epoch_end(self):
-        pass
+        # This hook is used to render the full video in optimization mode.
+        if self.cfg.use_optimization and self.trainer.global_step > 0:
+            if self.true_global_step % 10 != 0:
+                return
+            threestudio.info(f"Rendering validation video at step {self.true_global_step}...")
+            out_file = self.get_save_path(f"it{self.true_global_step}-val.mp4")
+            writer = imageio.get_writer(out_file, fps=24)
+            
+            # Get the single fixed validation camera pose.
+            batch = self.trainer.datamodule.val_dataloader().dataset[0]
+            
+            from ..geometry.gaussian_4d_motion import Camera
+            fovy = batch["fovy"][0]; fovx = batch["fovx"][0] if "fovx" in batch else fovy
+            w2c, proj, cam_p = get_cam_info_gaussian(c2w=batch["c2w"][0], fovx=fovx, fovy=fovy, znear=batch.get("znear", 0.1), zfar=batch.get("zfar", 100.0))
+            viewpoint_cam = Camera(
+                FoVx=fovx, FoVy=fovy, image_height=batch['height'], image_width=batch['width'],
+                world_view_transform=w2c, full_proj_transform=proj, camera_center=cam_p
+            )
+
+            num_render_frames = self.target_video_frames.shape[0]
+            for i in range(num_render_frames):
+                time_t = float(i) / (num_render_frames - 1) if num_render_frames > 1 else 0.0
+                with torch.no_grad():
+                    out = self.renderer(viewpoint_camera=viewpoint_cam, time=time_t, bg_color=self.background.env_color)
+                img = (out["render"].permute(1, 2, 0).clamp(0,1).cpu().numpy() * 255).astype(np.uint8)
+                writer.append_data(img)
+            writer.close()
+            threestudio.info(f"Saved validation video to {out_file}")
+        else:
+            # original g2l val logic
+            pass
 
     def test_step(self, batch, batch_idx):
+        
+        # For optimization mode, the validation logic is sufficient for testing.
+        if self.cfg.use_optimization:
+            self.on_validation_epoch_end()
+            return
+        
+        #original g2l test logic:
+        
         # free VRAM by deleting diffusion guidance etc.
         self.guidance = None
         self.flow_back_projection = 1
