@@ -21,8 +21,8 @@ data_type: "4dgs-multi-view-sample-once-datamodule"
 data:
   height: 320
   width: 512
-  num_frames: 32
-  eval_frames: 32
+  num_frames: 64
+  eval_frames: 64
   eval_height: 640
   eval_width: 1024
   test_height: 1080
@@ -49,6 +49,8 @@ data:
   num_optimization_steps_before_resampling: 0
   random_views: false
 
+  fixed_view: ${system.use_optimization}
+
 # -------------------------------------------------------------------- #
 #  Gaussians-to-Life system
 # -------------------------------------------------------------------- #
@@ -59,6 +61,18 @@ system:
   geometry_type: "gaussian-splatting-trajectories"
   back_ground_color: [1.0, 1.0, 1.0]
   last_step_rigid: false
+  use_optimization: false #set to true for enabling optimization
+
+  optimizer:
+    optimizer_type: "Adam"
+    args:
+      lr: 0.0003
+      betas: [0.9, 0.999]
+      
+  loss:
+    lambda_l1: 0.8
+    lambda_lpips: 0.2
+    lambda_ssim: 0.0
 
   geometry:
     sh_degree: 0
@@ -85,6 +99,8 @@ system:
     debug: false
     invert_bg_prob: 1.0
 
+
+
   # ------------------------------------------------------------ #
   #  prompt processor (not used by LTX)
   # ------------------------------------------------------------ #
@@ -106,11 +122,11 @@ system:
 
     height:           ${data.height}
     width:            ${data.width}
-    num_frames:       32
-    frame_rate:       16 
+    num_frames:       64
+    frame_rate:       24 
 
     #anchor_viewpoint_sample_path: ""
-    anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/lego-up_forwardfast2.mp4"
+    anchor_viewpoint_sample_path: "custom/gaussians2life/assets/sample_initial_videos/lego-up_backwards.mp4"
 
 # -------------------------------------------------------------------- #
 #  Check-pointing
