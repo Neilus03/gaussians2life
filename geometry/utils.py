@@ -512,3 +512,26 @@ def rot_to_quat_batched(mats):
     q = roma.rotmat_to_unitquat(mats)
     q = roma.quat_xyzw_to_wxyz(q)
     return q
+
+
+import torch
+import torch.nn.functional as F
+
+def quat_slerp(q0: torch.Tensor, q1: torch.Tensor, t: float) -> torch.Tensor:
+    """
+    Simple quaternion slerp for two unit quats.
+    q0, q1 – (*,4) tensors; t – scalar in [0,1].
+    """
+    dot = (q0 * q1).sum(-1, keepdim=True)
+    same = dot.abs() > 0.9995
+
+    theta = torch.acos(dot.clamp(-0.9995, 0.9995))
+    sin_theta = torch.sin(theta)
+
+    result = torch.where(
+        same,
+        F.normalize(q0 + t * (q1 - q0), p=2, dim=-1),
+        (torch.sin((1 - t) * theta) * q0 + torch.sin(t * theta) * q1) / sin_theta
+    )
+    return result
+
