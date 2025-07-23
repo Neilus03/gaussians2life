@@ -7,7 +7,10 @@ from plyfile import PlyData
 from threestudio.models.geometry.base import BaseGeometry
 from threestudio.utils.typing import *
 
-from .utils import o3d_knn, build_scaling_rotation, strip_symmetric, inverse_sigmoid
+import torch.nn as nn
+
+
+from .utils import o3d_knn, build_scaling_rotation, strip_symmetric, inverse_sigmoid, quat_slerp
 import math
 from ..utils import dprint
 
@@ -53,6 +56,8 @@ class GaussianModel(BaseGeometry):
 
         save_path_deformations: str = ""
         discard_mask: bool = False
+        
+        
 
     cfg: Config
 
@@ -75,6 +80,7 @@ class GaussianModel(BaseGeometry):
 
     def configure(self) -> None:
         super().configure()
+        self.is_learning_motion = False #flag for track mode
         self.active_sh_degree = 0
         self.max_sh_degree = self.cfg.sh_degree
         self._xyz = torch.empty(0)
@@ -621,3 +627,187 @@ class GaussianModel(BaseGeometry):
         self.rotation_gt = data["rotation"].to(self.device) if "rotation" in data else None
         self.scaling_gt = data["scaling"].to(self.device) if "scaling" in data else None
         dprint("Loaded deformations from {}".format(path))
+
+    def initialize_learnable_motion(self, num_keyframes: int):
+        """
+        onverts motion attributes into learnable parameters for optimization.
+        This is called by the system if use_optimization is true.
+        """
+        threestudio.info(f"Initializing learnable motion for {num_keyframes} keyframes")
+        num_points = self._xyz.shape[0] #number of points in the gaussian cloud
+        
+        #initialize displacement to 0:
+        self.displacement = nn.Parameter(torch.zeros(num_keyframes, num_points, 3, device=self.device))
+        
+        #initialize rotation delta to identity: (w,x,y,z -> [1,0,0,0])
+        identity_rot = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(num_keyframes, num_points, 1)
+        
+        self.rotation_delta = nn.Parameter(identity_rot)
+        
+        # Initialize scaling delta (additive in log space) to zero
+        self.scaling_delta = nn.Parameter(torch.zeros(num_keyframes, num_points, 3, device=self.device))
+        
+        #set the flag to true
+        self.is_learning_motion = True
+        
+        # Nullify the trajectory-based attributes to prevent accidental use
+        self.anchor_trajectories = None
+        self.displacement_from_trajectory = None
+        
+    ### get trainable parameters
+    
+    def get_trainable_motion_parameters(self):
+        """
+        Returns an iterator over the trainable motion parameters for the optimizer
+        """
+        if not self.is_learning_motion:
+            return iter([]) #if not learning motion, return empty iterator
+        
+        yield self.displacement
+        yield self.rotation_delta
+        yield self.scaling_delta
+        
+    def update(self, t: float, **kwargs):
+        """
+        Updates the motion attributes based on the current timestep.
+        Handles both optimization and inference-lifting modes.
+        """
+        # --- Optimization Path ---
+        if self.is_learning_motion:
+            num_keyframes = self.displacement.shape[0]
+            if num_keyframes <= 1:
+                interp_disp = self.displacement[0]
+                interp_rot = self.rotation_delta[0]
+                interp_scale_delta = self.scaling_delta[0]
+            else:
+                t_scaled = t * (num_keyframes - 1)
+                idx_floor = int(t_scaled)
+                idx_ceil = min(idx_floor + 1, num_keyframes - 1)
+                weight = t_scaled - idx_floor
+                
+                interp_disp = torch.lerp(self.displacement[idx_floor], self.displacement[idx_ceil], weight)
+                
+                rot_floor = self.rotation_delta[idx_floor]
+                rot_ceil = self.rotation_delta[idx_ceil]
+                interp_rot = quat_slerp(rot_floor, rot_ceil, weight)           
+                
+                scale_delta_floor = self.scaling_delta[idx_floor]
+                scale_delta_ceil = self.scaling_delta[idx_ceil]
+                interp_scale_delta = torch.lerp(scale_delta_floor, scale_delta_ceil, weight)
+            
+            out = {"displacement": interp_disp}
+            if self.cfg.update_rotation:
+                out["rotation"] = interp_rot
+            if self.cfg.update_scale:
+                # Additive in log space is multiplicative in linear space
+                out["scale"] = torch.exp(interp_scale_delta)
+            return out
+        
+        # --- Original Gaussians2Life Path ---
+        if hasattr(self, "displacement_gt") and self.displacement_gt is not None:
+            trajectory_frame_times = torch.linspace(0.0, 1.0, self.trajectory_length)
+            step_check = [math.isclose(t, frame_time, abs_tol=1e-3) for frame_time in trajectory_frame_times]
+            assert any(step_check), "timestep not in saved trajectory"
+            step = step_check.index(True)
+            out = {
+                "displacement": self.displacement_gt[step]
+            }
+            if self.cfg.update_rotation:
+                out["rotation"] = self.rotation_gt[step]
+            if self.cfg.update_scale:
+                out["scale"] = self.scaling_gt[step]
+            return out
+
+        if not hasattr(self, "displacement") or self.displacement is None:
+            out = {
+                "displacement": torch.zeros_like(self._xyz),
+            }
+            if self.cfg.update_rotation:
+                out["rotation"] = torch.zeros_like(self._rotation)
+                out["rotation"][..., 0] = 1
+            if self.cfg.update_scale:
+                out["scale"] = torch.ones_like(self._scaling)
+            return out
+
+        trajectories_per_timestep = [
+            sum([1 if 0 <= timestep + t < self.trajectory_length else 0 for timestep in self.timesteps])
+            for t in
+            range(- max(self.timesteps), self.trajectory_length - min(self.timesteps))]
+
+        trajectories_in_vide_per_start_timestep = [sum(trajectories_per_timestep[i:self.trajectory_length + i]) for i in
+                                                   range(
+                                                       len(trajectories_per_timestep) - self.trajectory_length + 1)]
+        max_trajectories_for_full_video, amount = max(
+            zip(range(len(trajectories_in_vide_per_start_timestep) - 1, -1, -1),
+                trajectories_in_vide_per_start_timestep[::-1]), key=lambda x: x[1])
+
+        self.zero_timestep = max(self.timesteps) - max_trajectories_for_full_video
+
+        displacement = self.displacement[:,
+                       max_trajectories_for_full_video:max_trajectories_for_full_video + self.trajectory_length]
+        rotation = self.rotation[:,
+                   max_trajectories_for_full_video:max_trajectories_for_full_video + self.trajectory_length]
+        scaling = self.scaling[:,
+                  max_trajectories_for_full_video:max_trajectories_for_full_video + self.trajectory_length]
+
+        trajectory_frame_times = torch.linspace(0.0, 1.0, self.trajectory_length)
+
+        # check if t is at one of the sampled timesteps
+        step_check = [math.isclose(t, frame_time, abs_tol=1e-3) for frame_time in trajectory_frame_times]
+        if any(step_check):
+            step = step_check.index(True)
+            out = {
+                "displacement": displacement[:, step],
+            }
+            if self.cfg.update_rotation:
+                out["rotation"] = rotation[:, step]
+            if self.cfg.update_scale:
+                out["scale"] = scaling[:, step]
+            return out
+        elif t > 0 and t < 1:
+            # perform linear interpolation between the nearest steps
+            step = math.floor(t * (self.trajectory_length - 1))
+            index_lower = step
+            index_upper = step + 1
+            weight_lower = t - index_lower / (self.trajectory_length - 1)
+            weight_upper = index_upper / (self.trajectory_length - 1) - t
+
+            weight_sum = weight_lower + weight_upper
+            weight_lower = weight_upper / weight_sum
+            weight_upper = (weight_sum - weight_upper) / weight_sum
+
+            interpolated_displacement = weight_lower * displacement[:, index_lower] + \
+                                        weight_upper * displacement[:, index_upper]
+            interpolated_rotation = weight_lower * rotation[:, index_lower] + \
+                                    weight_upper * rotation[:, index_upper]
+            interpolated_scaling = weight_lower * scaling[:, index_lower] + \
+                                   weight_upper * scaling[:, index_upper]
+
+            out = {
+                "displacement": interpolated_displacement,
+            }
+            if self.cfg.update_rotation:
+                out["rotation"] = interpolated_rotation
+            if self.cfg.update_scale:
+                out["scale"] = interpolated_scaling
+            return out
+        else:
+            def polynomial_extrapolate(tensor, t, degree=2):
+                T = tensor.shape[0]
+                x = torch.linspace(0, 1, T, dtype=torch.float32, device=tensor.device)
+                X_vander = torch.vander(x, N=degree + 1, increasing=True)
+                y = tensor.unsqueeze(1)
+                coeffs = torch.linalg.lstsq(X_vander, y).solution
+                next_timestep = torch.tensor([t ** d for d in range(degree + 1)], dtype=torch.float32,
+                                             device=tensor.device) @ coeffs
+                return next_timestep
+
+            fun = lambda x: polynomial_extrapolate(x, t=t)
+            out = {
+                "displacement": torch.vmap(torch.vmap(fun, in_dims=1))(displacement).squeeze(-1),
+            }
+            if self.cfg.update_rotation:
+                out["rotation"] = torch.vmap(torch.vmap(fun, in_dims=1))(rotation).squeeze(-1)
+            if self.cfg.update_scale:
+                out["scale"] = torch.vmap(torch.vmap(fun, in_dims=1))(scaling).squeeze(-1)
+            return out
