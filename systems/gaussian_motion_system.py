@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import torch.nn.functional as F
 
-
+import json
 import time
 from ..utils import set_debug, dprint, FlowBackProjection, build_intrinsics
 
@@ -864,44 +864,46 @@ class GaussTo4D(BaseLift3DSystem):
 
         geometry = GeometryObject(self.geometry.get_xyz)
 
-        # Compute losses
-        displacement = torch.abs(out["updated_pos"]).mean() / len(out["updated_pos"])
-        if "updated_rot" in out:
-            rotation = torch.abs(
-                out["updated_rot"] - torch.tensor([1., 0., 0., 0.], device=out["updated_rot"].device)).mean() / len(
-                out["updated_rot"])
-        if "updated_scale" in out:
-            scale = torch.abs(out["updated_scale"] - 1.).mean() / len(out["updated_scale"])
-        rigidity = rigidity_loss(out["positions"], out["rotations"], geometry)
-        momentum = torch.abs(out["updated_pos"][1:] - out["updated_pos"][:-1]).mean() / len(out["updated_pos"] - 1)
-        arap = arap_loss(out["positions"], geometry)
-        jsd = jsd_loss(out["positions"])
-        isometry = longterm_isometry_loss(out["positions"], geometry)
-        rotation_sim = rotation_similarity_loss(out["rotations"], geometry)
+        # =====================================================================
+        # ======== METRIC COMPUTATION AND STORAGE =============================
+        # =====================================================================
 
-        # print results in nice table
-        print("-------------------RESULTS-------------------")
-        print(f"{'Displacement':<20}\t{displacement.item():.8f}")
+        # Dictionary to hold all our metrics
+        metrics = {}
+
+        # Compute geometry-based metrics
+        metrics['displacement'] = (torch.abs(out["updated_pos"]).mean() / len(out["updated_pos"])).item()
         if "updated_rot" in out:
-            print(f"{'Rotation':<20}\t{rotation.item():.8f}")
+            metrics['rotation'] = (torch.abs(
+                out["updated_rot"] - torch.tensor([1., 0., 0., 0.], device=out["updated_rot"].device)).mean() / len(
+                out["updated_rot"])).item()
         if "updated_scale" in out:
-            print(f"{'Scale':<20}\t{scale.item():.8f}")
-        print(f"{'Rigidity':<20}\t{rigidity.item():.8f}")
-        print(f"{'Momentum':<20}\t{momentum.item():.8f}")
-        print(f"{'ARAP':<20}\t{arap.item():.8f}")
-        print(f"{'JSD':<20}\t{jsd.item():.8f}")
-        print(f"{'Isometry':<20}\t{isometry.item():.8f}")
-        print(f"{'Rotation similarity':<20}\t{rotation_sim.item():.8f}")
-        print("-------------------RESULTS-------------------")
+            metrics['scale'] = (torch.abs(out["updated_scale"] - 1.).mean() / len(out["updated_scale"])).item()
+        
+        metrics['rigidity'] = rigidity_loss(out["positions"], out["rotations"], geometry).item()
+        metrics['momentum'] = (torch.abs(out["updated_pos"][1:] - out["updated_pos"][:-1]).mean() / len(out["updated_pos"] - 1)).item()
+        metrics['arap'] = arap_loss(out["positions"], geometry).item()
+        metrics['jsd'] = jsd_loss(out["positions"]).item()
+        metrics['isometry'] = longterm_isometry_loss(out["positions"], geometry).item()
+        metrics['rotation_similarity'] = rotation_similarity_loss(out["rotations"], geometry).item()
 
         # Compute CLIP scores
-        print(out["comp_rgb"].shape)
-        naive, advanced = clip_scores(out["comp_rgb"].permute(0, 3, 1, 2), self.prompt_utils)
+        clip_naive, clip_advanced = clip_scores(out["comp_rgb"].permute(0, 3, 1, 2), self.prompt_utils)
+        metrics['clip_score_naive'] = clip_naive
+        metrics['clip_score_advanced'] = clip_advanced
 
-        print(f"Naive CLIP score: {naive:.8f}")
-        print(f"Advanced CLIP score: {advanced:.8f}")
-        print("-------------------RESULTS-------------------")
+        # --- Print results to console (optional, but good for monitoring) ---
+        print("------------------- METRIC RESULTS -------------------")
+        for key, value in metrics.items():
+            print(f"{key:<25}{value:.8f}")
+        print("------------------------------------------------------")
 
+        # --- Save metrics to a JSON file ---
+        save_path = self.get_save_path("metrics.json")
+        with open(save_path, 'w') as f:
+            json.dump(metrics, f, indent=4)
+        
+        print(f"Metrics saved to {save_path}")
         dprint(f"C) Test time evaluation: {time.time() - start}")
 
     def on_test_epoch_end(self):
